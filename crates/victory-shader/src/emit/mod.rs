@@ -122,23 +122,18 @@ pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
-/// The iteration count after which a translated loop is left, per lane and
-/// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
+/// The iteration budget after which translated loops exit per lane for the
+/// whole program: [`DEFAULT_LOOP_LIMIT`] (`65,536`).
 ///
-/// With the `diagnostics` feature, `VICTORY_SHADER_LOOP_LIMIT` (decimal or
-/// `0x` hex, at least 1) sets it instead. A loop that hits the limit in
-/// every lane of a full-screen pass still runs for seconds (2^20 times a
-/// 4K screen is about 10^13 iterations); a much lower limit shows whether
-/// such loops are what makes a frame slow. The value is part of the
-/// translation, so the shader cache must key on it (`victory-gpu`'s does).
+/// `VICTORY_SHADER_LOOP_LIMIT` (decimal or `0x` hex, at least 1) overrides it
+/// in any build. A loop that hits the limit in every lane of a full-screen
+/// pass can stall the GPU; lowering it (e.g. `256` on NVIDIA while wave64
+/// producers are missing) cuts runaway GPU waits dramatically. The value is
+/// part of the translation key, so the shader cache isolates each setting.
 pub fn loop_limit() -> u32 {
     static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
-        if cfg!(feature = "diagnostics") {
-            parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
-        } else {
-            lower::LOOP_LIMIT
-        }
+        parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
     })
 }
 

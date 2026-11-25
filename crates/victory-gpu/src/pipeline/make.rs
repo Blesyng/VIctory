@@ -158,27 +158,32 @@ pub(crate) fn early(p: &Arc<Pending>) {
 }
 
 /// Waits for `p` while frame `frame` has budget of its kind left.
+/// All threads waiting in the same frame share a single wall-clock deadline
+/// so N concurrent recording threads never multiply the per-frame budget by N.
 fn wait(p: &Pending, frame: u64) {
-    static FRAME: [AtomicU64; 2] = [const { AtomicU64::new(u64::MAX) }; 2];
-    static WAITED_US: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    static DEADLINE: [Mutex<Option<(u64, Instant)>>; 2] = [const { Mutex::new(None) }; 2];
     let kind = usize::from(p.screen);
     let budget = [BUDGET, SCREEN_BUDGET][kind];
-    let waited = &WAITED_US[kind];
-    if FRAME[kind].swap(frame, Ordering::Relaxed) != frame {
-        waited.store(0, Ordering::Relaxed);
-    }
-    let left = budget.saturating_sub(Duration::from_micros(waited.load(Ordering::Relaxed)));
-    let started = Instant::now();
+    let deadline = {
+        let mut slot = DEADLINE[kind].lock().unwrap_or_else(|e| e.into_inner());
+        match *slot {
+            Some((f, dl)) if f == frame => dl,
+            _ => {
+                let dl = Instant::now() + budget;
+                *slot = Some((frame, dl));
+                dl
+            }
+        }
+    };
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
-        let rest = left.saturating_sub(started.elapsed());
+        let rest = deadline.saturating_duration_since(Instant::now());
         if rest.is_zero() {
             break;
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    waited.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
 /// What the workers take from: the ordinary pipelines, the screen passes.

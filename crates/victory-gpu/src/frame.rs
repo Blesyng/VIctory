@@ -130,10 +130,17 @@ fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
     });
     let elapsed = c.start.elapsed().as_nanos();
     let interval = c.interval.as_nanos().max(1);
-    let tick =
-        (c.first + (elapsed / interval + 1) as u64).max(last(kind).load(Ordering::Relaxed) + 1);
-    let at = u128::from(tick - c.first) * interval;
-    let wait = Duration::from_nanos(at.saturating_sub(elapsed) as u64);
+    let now_tick = c.first + (elapsed / interval) as u64;
+    let prev = last(kind).load(Ordering::Relaxed);
+    let (tick, wait) = if now_tick > prev {
+        // A tick already elapsed while a slow frame ran: consume it immediately
+        // instead of sleeping until the next tick boundary.
+        (now_tick, Duration::ZERO)
+    } else {
+        let tick = prev + 1;
+        let at = u128::from(tick - c.first) * interval;
+        (tick, Duration::from_nanos(at.saturating_sub(elapsed) as u64))
+    };
     if wait <= limit {
         last(kind).fetch_max(tick, Ordering::Relaxed);
     }
@@ -153,17 +160,21 @@ pub(crate) extern "system" fn wait(
     token: *mut u64,
 ) -> HRESULT {
     let origin = kind == ORIGIN;
-    let (wait, hr) = if uncapped() {
+    let (_wait, hr) = if uncapped() {
         last(kind).fetch_add(1, Ordering::Relaxed);
         (Duration::ZERO, S_OK)
     } else {
         let limit = Duration::from_millis(u64::from(timeout_ms));
         let (_, wait) = next_tick(kind, limit);
         let hr = if wait > limit {
-            std::thread::sleep(limit);
+            if !limit.is_zero() {
+                std::thread::sleep(limit);
+            }
             TIMEOUT
         } else {
-            std::thread::sleep(wait);
+            if !wait.is_zero() {
+                std::thread::sleep(wait);
+            }
             S_OK
         };
         (wait, hr)
@@ -183,7 +194,7 @@ pub(crate) extern "system" fn wait(
         timeout_ms,
         flags,
         hr,
-        wait_us = wait.as_micros() as u64,
+        wait_us = _wait.as_micros() as u64,
         frame = current(),
         "frame wait"
     );

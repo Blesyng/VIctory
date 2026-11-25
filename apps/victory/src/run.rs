@@ -41,8 +41,6 @@ pub fn run(
                 );
             }
         }
-        #[cfg(not(feature = "diagnostics"))]
-        println!("note           VICTORY_SKIP_PIPELINES requires --features diagnostics");
     }
 
     let cfg = victory_core::Config::load()?;

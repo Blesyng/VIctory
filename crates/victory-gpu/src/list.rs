@@ -657,7 +657,21 @@ extern "system" fn copy_buffer_region(
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
+/// Returns the D3D12 plane count for depth-stencil vs single-plane formats
+/// (`R32G8X24` and `R24G8` families have 2 planes; single-plane formats have 1).
+#[cfg(windows)]
+fn format_plane_count(dxgi_format: u32) -> u8 {
+    match dxgi_format {
+        19..=22 | 44..=47 => 2,
+        _ => 1,
+    }
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    #[cfg(windows)]
+    if dst == src {
+        return;
+    }
     #[cfg(windows)]
     if let Some(list) = host_list(this) {
         list.count_write();
@@ -674,6 +688,21 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         ) {
             // shortcut: not between textures without their largest mips.
             if crate::resource::skipped_mips(dst) + crate::resource::skipped_mips(src) > 0 {
+                return;
+            }
+            // PC D3D12 forbids copying between 2-plane depth-stencil (e.g. R32G8X24)
+            // and 1-plane formats (e.g. R32); NVIDIA faults with DEVICE_REMOVED.
+            // SAFETY: live D3D12 resources.
+            let (to_fmt, from_fmt) = unsafe { (to.GetDesc().Format.0 as u32, from.GetDesc().Format.0 as u32) };
+            if format_plane_count(to_fmt) != format_plane_count(from_fmt) {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        to_fmt,
+                        from_fmt,
+                        "skipping invalid copy_resource across mismatched depth/color plane counts"
+                    );
+                });
                 return;
             }
             if crate::texture::title_written(from) {
@@ -960,6 +989,22 @@ extern "system" fn copy_texture_region(
                 return;
             };
             if crate::resource::skipped_mips(src.resource) > 0 {
+                return;
+            }
+            // PC D3D12 forbids texture-to-texture copies across mismatched plane counts
+            // (e.g. R32G8X24 depth-stencil -> R32 single-plane); NVIDIA faults with DEVICE_REMOVED.
+            // SAFETY: live D3D12 textures.
+            let (to_fmt, from_fmt) =
+                unsafe { (to.GetDesc().Format.0 as u32, texture.GetDesc().Format.0 as u32) };
+            if format_plane_count(to_fmt) != format_plane_count(from_fmt) {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        to_fmt,
+                        from_fmt,
+                        "skipping invalid copy_texture_region across mismatched depth/color plane counts"
+                    );
+                });
                 return;
             }
             if crate::texture::title_written(texture) {

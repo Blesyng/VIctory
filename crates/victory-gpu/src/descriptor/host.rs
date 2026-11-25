@@ -72,6 +72,9 @@ struct DynamicSlots {
     len: usize,
     words: Vec<u64>,
     used: usize,
+    /// Smallest contiguous request size that failed since the last `free()`;
+    /// any request `>= no_run` short-circuits in O(1) without rescanning.
+    no_run: usize,
 }
 
 impl DynamicSlots {
@@ -81,6 +84,7 @@ impl DynamicSlots {
             len,
             words: vec![0u64; len.div_ceil(64)],
             used: 0,
+            no_run: usize::MAX,
         }
     }
 
@@ -150,17 +154,20 @@ impl DynamicSlots {
     }
 
     fn alloc(&mut self, n: usize) -> Option<usize> {
-        if n == 0 || n > self.len || self.used + n > self.len {
+        if n == 0 || n > self.len || self.used + n > self.len || n >= self.no_run {
             return None;
         }
-        let first = self.find_in_range(self.cursor, self.len, n).or_else(|| {
+        let Some(first) = self.find_in_range(self.cursor, self.len, n).or_else(|| {
             if self.cursor > 0 {
                 let wrap_end = self.cursor.saturating_add(n - 1).min(self.len);
                 self.find_in_range(0, wrap_end, n)
             } else {
                 None
             }
-        })?;
+        }) else {
+            self.no_run = self.no_run.min(n);
+            return None;
+        };
         self.set_range(first, n, true);
         self.cursor = (first + n) % self.len;
         Some(first)
@@ -168,6 +175,7 @@ impl DynamicSlots {
 
     fn free(&mut self, start: usize, len: usize) {
         self.set_range(start, len, false);
+        self.no_run = usize::MAX;
     }
 }
 

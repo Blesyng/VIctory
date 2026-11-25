@@ -578,9 +578,13 @@ struct Lower<'a> {
     code_table: Option<(V, u32, u32)>,
     /// Private (scratch) memory: the lane's array and its dwords.
     scratch: Option<(V, u32)>,
-    /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
-    /// IR block, and its incoming (value, DXIL block) pairs.
+    /// Loop headers' iteration counters (kept for [`Lower::leave_loops`]): the
+    /// phi by IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    /// Single per-lane loop iteration budget (`alloca i32` in the entry block)
+    /// summed across all loop back-edges in the program so nested loops cannot
+    /// multiply the budget and trigger a GPU TDR.
+    loop_budget: Option<V>,
     /// Loops that lanes leave through one block, by that block: the header
     /// and the scalar values the loop writes that code after it reads (see
     /// [`Lower::leave_loops`]).
@@ -612,14 +616,13 @@ struct PendingPath {
     incoming: Vec<(usize, Result<V, Source>)>,
 }
 
-/// Iterations after which a loop is left (per entry into it), unless
-/// [`super::loop_limit`] says otherwise. The console runs a loop as long as
-/// its data says; data the host has not mirrored yet (a null view reads
-/// zeros) can make that four billion iterations, which hangs the host GPU
-/// until the driver resets it. A lane that reaches the limit leaves the
+/// Total loop iterations per lane for the whole program after which loops stop,
+/// unless [`super::loop_limit`] says otherwise. Summed across all back-edges
+/// so nested data-driven loops cannot multiply their limits and hang the host
+/// GPU until the driver resets it. A lane that reaches the limit leaves the
 /// program as killed (a pixel discards).
-// shortcut: a genuine loop of more iterations than this is cut short too.
-pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+// shortcut: a genuine program executing more total back-edges than this is cut short too.
+pub(super) const LOOP_LIMIT: u32 = 1 << 16;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -1360,6 +1363,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             scratch: None,
             counters: HashMap::new(),
+            loop_budget: None,
             loop_exits: HashMap::new(),
             loop_bodies: HashMap::new(),
             finals: HashMap::new(),
@@ -2002,6 +2006,12 @@ impl<'a> Lower<'a> {
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
             }
+        }
+        if !self.counters.is_empty() {
+            let slot = self.s.m.alloca(self.s.entry, self.s.t.i32);
+            let zero = self.s.m.i32(0);
+            self.s.m.store(self.s.entry, slot, zero);
+            self.loop_budget = Some(slot);
         }
         self.find_loop_exits();
         self.cur = self.s.entry;
@@ -12045,7 +12055,26 @@ impl<'a> Lower<'a> {
             return Err("a 16-bit output the stage data does not mark");
         }
         // A mesh lane writes its own vertex or primitive, where it exports.
+        // Clamp against declared `max_vertices` / `max_primitives`: Xbox clips
+        // out-of-range exports whereas PC NVIDIA drivers treat them as UB/TDR.
         let at = if mesh {
+            let guard = if let Some(m) = self.s.mesh {
+                let max = if primitive {
+                    m.max_primitives
+                } else {
+                    m.max_vertices
+                };
+                let flat = self.mesh_thread();
+                let c = self.cur;
+                let max_v = self.s.m.i32(max);
+                let in_bounds = self.s.m.cmp(c, pred::IULT, flat, max_v);
+                Some(match guard {
+                    Some(g) => self.s.m.bin(c, Bin::And, g, in_bounds),
+                    None => in_bounds,
+                })
+            } else {
+                guard
+            };
             self.begin_guarded(guard)
         } else {
             None
@@ -12106,20 +12135,42 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Mesh: `exp prim` as the lane's primitive. Bit 31 culls it (all
-    /// indices 0: no area).
+    /// Mesh: `exp prim` as the lane's primitive. Bit 31 (or any vertex index
+    /// past `max_vertices`) culls it (all indices 0: no area). Out-of-range
+    /// primitive lanes (`>= max_primitives`) are guarded out.
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
+        let guard = if let Some(m) = self.s.mesh {
+            let flat = self.mesh_thread();
+            let c = self.cur;
+            let max_p = self.s.m.i32(m.max_primitives);
+            let in_bounds = self.s.m.cmp(c, pred::IULT, flat, max_p);
+            Some(match guard {
+                Some(g) => self.s.m.bin(c, Bin::And, g, in_bounds),
+                None => in_bounds,
+            })
+        } else {
+            guard
+        };
         let at = self.begin_guarded(guard);
         let c = self.cur;
         let z = self.s.m.i32(0);
-        let culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut args = vec![self.mesh_thread()];
-        for k in 0..3 {
-            let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
+        let mut culled = self.s.m.cmp(c, pred::SLT, x, z);
+        let max_v = self.s.mesh.map(|m| self.s.m.i32(m.max_vertices));
+        let mut raw_idx = [z; 3];
+        for (k, slot) in raw_idx.iter_mut().enumerate() {
+            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x3FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
+            if let Some(mv) = max_v {
+                let oob = self.s.m.cmp(c, pred::IUGE, i, mv);
+                culled = self.s.m.bin(c, Bin::Or, culled, oob);
+            }
+            *slot = i;
+        }
+        let mut args = vec![self.mesh_thread()];
+        for i in raw_idx {
             args.push(self.s.m.select(c, culled, z, i));
         }
         let void = self.s.t.void;
@@ -12705,20 +12756,25 @@ impl<'a> Lower<'a> {
     }
 
     /// A back edge to header `to` (a back edge keeps its block, no
-    /// critical-edge block): the count goes up; the result compares it with
-    /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
+    /// critical-edge block): advances both the per-header iteration phi (used
+    /// by [`Lower::leave_loops`]) and the program-wide per-lane loop budget,
+    /// comparing the total against [`super::loop_limit`] by `p`.
     fn count_iteration(&mut self, to: usize, p: u8) -> V {
         let c = self.cur;
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = self.s.m.i32(super::loop_limit());
         self.counters
             .get_mut(&to)
             .expect("header")
             .1
             .push((next, c));
-        self.s.m.cmp(c, p, next, limit)
+        let budget = self.loop_budget.expect("loop budget");
+        let used = self.s.m.load(c, budget);
+        let total = self.s.m.bin(c, Bin::Add, used, one);
+        self.s.m.store(c, budget, total);
+        let limit = self.s.m.i32(super::loop_limit());
+        self.s.m.cmp(c, p, total, limit)
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
