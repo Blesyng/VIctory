@@ -113,8 +113,7 @@ static USES: AtomicU64 = AtomicU64::new(0);
 fn budget() -> u64 {
     static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *BUDGET.get_or_init(|| {
-        let low_spec = std::env::var("VICTORY_LOW_SPEC").as_deref() == Ok("1");
-        let default_mb = if low_spec { 128 } else { 384 };
+        let default_mb = if crate::low_spec() { 128 } else { 384 };
         std::env::var("VICTORY_STAGING_BUDGET_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())

@@ -75,5 +75,13 @@ mod watch;
 #[cfg(windows)]
 pub use host::on_failure;
 pub use memstat::report as memory_report;
+
+/// Whether the low-spec memory budget profile (`VICTORY_LOW_SPEC=1`) is active,
+/// targeting discrete GPUs with 2–4 GiB VRAM and hosts with <= 20 GiB RAM.
+#[cfg(windows)]
+pub(crate) fn low_spec() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOW_SPEC").is_some_and(|v| v == "1"))
+}
 #[cfg(windows)]
 pub use watch::{title_memory_committed, title_memory_remapped, title_memory_written, writing as kernel_will_write};

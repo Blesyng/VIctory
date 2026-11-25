@@ -18,6 +18,33 @@ pub fn run(
 
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
+
+    // Low-spec optimization profile (targeting <= 4GB VRAM and <= 20GB RAM)
+    if std::env::var_os("VICTORY_LOW_SPEC").is_some_and(|v| v == "1") {
+        println!("profile        low-spec (4GB VRAM / 20GB RAM budget)");
+        // SAFETY: called on the main thread during early startup before any
+        // title or worker threads are spawned.
+        unsafe {
+            if std::env::var_os("VICTORY_TEXTURE_MAX").is_none() {
+                std::env::set_var("VICTORY_TEXTURE_MAX", "512");
+            }
+            if std::env::var_os("VICTORY_STAGING_BUDGET_MB").is_none() {
+                std::env::set_var("VICTORY_STAGING_BUDGET_MB", "128");
+            }
+            if std::env::var_os("VICTORY_CARD_BUFFERS").is_none() {
+                std::env::set_var("VICTORY_CARD_BUFFERS", "0");
+            }
+            if std::env::var_os("VICTORY_SKIP_PIPELINES").is_none() {
+                std::env::set_var(
+                    "VICTORY_SKIP_PIPELINES",
+                    "4e35b816f2f91d68,b3ba0ef9ee352720,5d627391703fcb4c,ec6e4c363cf9ef2b,c89489afd89ee7f0,45f081396c2c59ba,63083c777948927a,0bd4d80ad23b106b",
+                );
+            }
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        println!("note           VICTORY_SKIP_PIPELINES requires --features diagnostics");
+    }
+
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;

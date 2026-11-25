@@ -102,13 +102,17 @@ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Card buffers with pending CPU→VRAM uploads (`dirty_up`).
 static DIRTY_CARDS: Mutex<Vec<Weak<CardState>>> = Mutex::new(Vec::new());
 
-/// Whether VRAM card buffers are enabled (`VICTORY_CARD_BUFFERS=0` disables).
+/// Whether VRAM card buffers are enabled (`VICTORY_CARD_BUFFERS=0` disables;
+/// disabled by default in `VICTORY_LOW_SPEC=1` unless explicitly set to `1`).
 pub(crate) fn enabled() -> bool {
     if cfg!(test) {
         return false;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_CARD_BUFFERS") {
+        Some(v) => v != "0",
+        None => !crate::low_spec(),
+    })
 }
 
 /// `(min_bytes, max_total_bytes)` for card buffers:

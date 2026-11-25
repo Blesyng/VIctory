@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -55,6 +55,8 @@ pub(crate) struct Shadow {
     sparse: Option<Sparse>,
     /// Device-local VRAM mirror (`DEFAULT`) + Wave64 GPU hash state (`card.rs`).
     card: Option<Arc<crate::card::CardState>>,
+    /// Last presented host frame this shadow was accessed (lock-free LRU clock).
+    last_used: AtomicU64,
 }
 
 struct Direct {
@@ -135,8 +137,17 @@ fn pooled(n: usize) -> Vec<u8> {
 /// each time, a tenth of the submitting thread's time).
 static TILE_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
-/// Tile snapshots kept at most (512 MiB).
+/// Tile snapshots kept at most (512 MiB default, 64 MiB in low-spec mode).
 const TILE_POOL_MOST: usize = 8192;
+const TILE_POOL_MOST_LOW_SPEC: usize = 1024;
+
+fn tile_pool_most() -> usize {
+    if crate::low_spec() {
+        TILE_POOL_MOST_LOW_SPEC
+    } else {
+        TILE_POOL_MOST
+    }
+}
 
 /// An empty buffer with room for a tile.
 fn pooled_tile() -> Vec<u8> {
@@ -148,9 +159,10 @@ fn pooled_tile() -> Vec<u8> {
 
 /// Returns tile snapshots to their pool.
 fn give_back_tiles(all: impl Iterator<Item = Vec<u8>>) {
+    let limit = tile_pool_most();
     let mut pool = TILE_POOL.lock().unwrap_or_else(|e| e.into_inner());
     for v in all {
-        if pool.len() < TILE_POOL_MOST && v.capacity() >= PAGE {
+        if pool.len() < limit && v.capacity() >= PAGE {
             pool.push(v);
         }
     }
@@ -179,10 +191,20 @@ pub(crate) fn pool_bytes() -> u64 {
 /// Bytes the pool keeps at most: snapshots of the world's 174 MB heap
 /// would otherwise keep 8 of that size (1.4 GB of host memory) for good.
 const POOL_BYTES: usize = 512 << 20;
+const POOL_BYTES_LOW_SPEC: usize = 64 << 20;
+
+fn pool_bytes_limit() -> usize {
+    if crate::low_spec() {
+        POOL_BYTES_LOW_SPEC
+    } else {
+        POOL_BYTES
+    }
+}
 
 /// Returns a snapshot buffer to the pool (at most 8 kept, the largest,
-/// and no more than [`POOL_BYTES`] in all).
+/// and no more than [`pool_bytes_limit`] in all).
 fn give_back(v: Vec<u8>) {
+    let limit = pool_bytes_limit();
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
@@ -190,7 +212,7 @@ fn give_back(v: Vec<u8>) {
     let mut total = 0;
     pool.retain(|v| {
         total += v.capacity();
-        total <= POOL_BYTES
+        total <= limit
     });
 }
 
@@ -238,6 +260,13 @@ impl Shadow {
         unsafe { std::slice::from_raw_parts(self.data.add(self.offset(address) as usize), len) }.to_vec()
     }
 
+    /// Records the current presented host frame as this shadow's last use.
+    #[inline]
+    fn touch(&self) {
+        self.last_used
+            .store(crate::queue::presented(), Ordering::Relaxed);
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
@@ -245,6 +274,7 @@ impl Shadow {
 
             return;
         }
+        self.touch();
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
     }
@@ -277,6 +307,7 @@ impl Shadow {
             clean_spans: Mutex::default(),
             sparse: None,
             card,
+            last_used: AtomicU64::new(crate::queue::presented()),
         }
     }
 
@@ -481,6 +512,7 @@ impl Shadow {
         if self.direct.is_some() {
             return;
         }
+        self.touch();
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
     }
@@ -495,6 +527,7 @@ impl Shadow {
         if self.direct.is_some() {
             return;
         }
+        self.touch();
         if self.card.is_some() {
             self.pending
                 .lock()
@@ -658,6 +691,7 @@ impl Shadow {
         if self.direct.is_some() {
             return 0;
         }
+        self.touch();
         if let Some(root) = self.sparse.as_ref().and_then(|s| s.of.as_ref()) {
             return root.update_lazily(address, len, lazy);
         }
@@ -1028,6 +1062,7 @@ fn placed(
         clean_spans: Mutex::default(),
         sparse: None,
         card: None,
+        last_used: AtomicU64::new(crate::queue::presented()),
     })
 }
 
@@ -1532,12 +1567,128 @@ fn sweeps() -> bool {
     *ON.get_or_init(|| cfg!(test) || std::env::var("VICTORY_SWEEP_TILES").is_ok_and(|v| v == "1"))
 }
 
+/// Idle presented frames before an unused `Shadow` copy in `BUFFERS` or `LOOSE`
+/// is evicted and retired (`VICTORY_SHADOW_EVICT_FRAMES`; default `180` in
+/// low-spec mode, `0` / disabled otherwise).
+fn shadow_evict_frames() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        let default = if crate::low_spec() { 180 } else { 0 };
+        std::env::var("VICTORY_SHADOW_EVICT_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(default)
+    })
+}
+
+/// Pure LRU eligibility check for evicting a `Shadow` copy safely.
+fn shadow_is_idle(
+    last_used: u64,
+    frame: u64,
+    threshold: u64,
+    strong_count: usize,
+    has_pending: bool,
+) -> bool {
+    threshold > 0
+        && strong_count == 1
+        && !has_pending
+        && frame.saturating_sub(last_used) >= threshold
+}
+
+/// Evicts idle `Shadow` copies from `BUFFERS` (keeping their `Entry` metadata)
+/// and `LOOSE`, retiring them outside the map locks so in-flight GPU work and
+/// descriptor heap slots never suffer use-after-free.
+fn evict_idle_shadows_with(frame: u64, threshold: u64) -> usize {
+    if threshold == 0 {
+        return 0;
+    }
+    let mut retired: Vec<Arc<Shadow>> = Vec::new();
+    let mut bytes_freed = 0u64;
+    {
+        let mut map = buffers();
+        for entry in map.values_mut() {
+            let Some(shadow) = entry.shadow.as_ref() else {
+                continue;
+            };
+            if shadow.direct.is_some() || shadow.sparse.is_some() {
+                continue;
+            }
+            let has_pending = shadow
+                .pending
+                .try_lock()
+                .map_or(true, |p| !p.is_empty());
+            if shadow_is_idle(
+                shadow.last_used.load(Ordering::Relaxed),
+                frame,
+                threshold,
+                Arc::strong_count(shadow),
+                has_pending,
+            ) && let Some(gone) = entry.shadow.take()
+            {
+                bytes_freed = bytes_freed.saturating_add(gone.len);
+                retired.push(gone);
+            }
+        }
+    }
+    {
+        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let idle_keys: Vec<(u64, u64)> = map
+            .iter()
+            .filter_map(|(&k, shadow)| {
+                if shadow.direct.is_some() || shadow.sparse.is_some() {
+                    return None;
+                }
+                let has_pending = shadow
+                    .pending
+                    .try_lock()
+                    .map_or(true, |p| !p.is_empty());
+                shadow_is_idle(
+                    shadow.last_used.load(Ordering::Relaxed),
+                    frame,
+                    threshold,
+                    Arc::strong_count(shadow),
+                    has_pending,
+                )
+                .then_some(k)
+            })
+            .collect();
+        for key in idle_keys {
+            if let Some(gone) = map.remove(&key) {
+                bytes_freed = bytes_freed.saturating_add(gone.len);
+                retired.push(gone);
+            }
+        }
+    }
+    let count = retired.len();
+    for shadow in retired {
+        // Retired AFTER releasing BUFFERS/LOOSE locks to prevent lock-order
+        // inversion with RETIRED and guarantee GPU safety for KEEP_FRAMES.
+        crate::host::retire(shadow);
+    }
+    if count > 0 {
+        tracing::info!(
+            count,
+            mib = bytes_freed >> 20,
+            frame,
+            "evicted idle shadow buffers (LRU)"
+        );
+    }
+    count
+}
+
 /// Gives back the tiles nothing has asked about for some frames: what
 /// viewed them is gone. At the present of `frame`.
 pub(crate) fn sweep(frame: u64) {
     const EVERY: u64 = 32;
     const KEEP: u64 = 120;
-    if !frame.is_multiple_of(EVERY) || !sweeps() {
+    if !frame.is_multiple_of(EVERY) {
+        return;
+    }
+    let threshold = shadow_evict_frames();
+    if threshold > 0 {
+        evict_idle_shadows_with(frame, threshold);
+    }
+    if !sweeps() {
         return;
     }
     let all: Vec<Arc<Shadow>> = SPARSE
@@ -1701,6 +1852,7 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
             of,
         }),
         card: None,
+        last_used: AtomicU64::new(crate::queue::presented()),
     })
 }
 
@@ -2202,6 +2354,9 @@ fn find_copy(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         entry.shadow = Some(Arc::new(Shadow::new(buffer, data, gpu, key.0, len, card)));
     }
+    if let Some(s) = entry.shadow.as_ref() {
+        s.touch();
+    }
     entry.shadow.clone()
 }
 
@@ -2253,6 +2408,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         .find(|((s, l), _)| *s <= address && s + l >= end)
         .map(|(_, shadow)| shadow.clone())
     {
+        shadow.touch();
         return Some(shadow);
     }
     let h = host()?;
@@ -2457,5 +2613,21 @@ mod tests {
             cached[2],
             baseline[2].as_secs_f64() / cached[2].as_secs_f64(),
         );
+    }
+
+    #[test]
+    fn test_shadow_lru_eviction_policy() {
+        // Disabled threshold (0) never evicts
+        assert!(!shadow_is_idle(0, 1000, 0, 1, false));
+        // Still held by an active HostList / BindlessPlan / worker thread (strong_count > 1)
+        assert!(!shadow_is_idle(0, 1000, 180, 2, false));
+        // Pending GPU writes not yet copied back
+        assert!(!shadow_is_idle(0, 1000, 180, 1, true));
+        // Recently used (age < threshold)
+        assert!(!shadow_is_idle(900, 1000, 180, 1, false));
+        assert!(!shadow_is_idle(821, 1000, 180, 1, false));
+        // Eligible: strong_count == 1, no pending writes, age >= threshold
+        assert!(shadow_is_idle(820, 1000, 180, 1, false));
+        assert!(shadow_is_idle(0, 180, 180, 1, false));
     }
 }

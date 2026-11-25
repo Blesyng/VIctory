@@ -1141,35 +1141,22 @@ fn video_memory_percent() -> u64 {
 /// its sides to pass `VICTORY_TEXTURE_MAX`: by default 1024, 512 and then 256 as
 /// video memory fills up. All textures together did not fit, and paging them
 /// cost seconds a frame, or the driver failed.
+/// Pure mip-skip calculation for `over_cap`, separated for deterministic unit
+/// testing without relying on global `OnceLock` environment variables.
+///
+/// Only applies to streamed textures (`streamed && mode == Textures::Stream`)
+/// because `CopyResource` / `CopyTextureRegion` (`list.rs`) skip copies whose
+/// destination has `skipped_mips > 0`, which would blank committed/placed
+/// textures populated via GPU copies.
 #[cfg(windows)]
-fn over_cap(d: &ResourceDesc) -> u32 {
-    static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let set = *SET.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_MAX")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    });
-    let low_spec = std::env::var("VICTORY_LOW_SPEC").as_deref() == Ok("1");
-    let forced = set.is_some() || low_spec;
-    if !forced && (!STREAMED.get() || textures() != Textures::Stream) {
+fn over_cap_for(d: &ResourceDesc, max: u64, streamed: bool, mode: Textures) -> u32 {
+    if !streamed || mode != Textures::Stream {
         return 0;
     }
-    let max = set.unwrap_or_else(|| {
-        if low_spec {
-            512
-        } else {
-            match video_memory_percent() {
-                0..70 => 1024,
-                70..85 => 512,
-                _ => 256,
-            }
-        }
-    });
     const TEXTURE2D: u32 = 3;
     let block = (70..=84).contains(&d.format) || (94..=99).contains(&d.format);
     let uncompressed = (27..=32).contains(&d.format);
-    if (cfg!(test) && set.is_none() && !low_spec)
-        || max == 0
+    if max == 0
         || d.dimension != TEXTURE2D
         || d.flags & 7 != 0
         || (!block && !uncompressed)
@@ -1181,14 +1168,40 @@ fn over_cap(d: &ResourceDesc) -> u32 {
     let mut skip = 0;
     while (d.width.max(u64::from(d.height)) >> skip) > max
         && skip + 1 < u32::from(d.mip_levels)
-        && (d.width >> (skip + 1)) % align == 0
-        && u64::from(d.height >> (skip + 1)) % align == 0
+        && (d.width >> (skip + 1)).is_multiple_of(align)
+        && u64::from(d.height >> (skip + 1)).is_multiple_of(align)
         && d.width >> (skip + 1) > 0
         && d.height >> (skip + 1) > 0
     {
         skip += 1;
     }
     skip
+}
+
+#[cfg(windows)]
+fn over_cap(d: &ResourceDesc) -> u32 {
+    if cfg!(test) {
+        return 0;
+    }
+    static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    let max = set.unwrap_or_else(|| {
+        let pct = video_memory_percent();
+        if crate::low_spec() {
+            if pct < 60 { 512 } else { 256 }
+        } else {
+            match pct {
+                0..70 => 1024,
+                70..85 => 512,
+                _ => 256,
+            }
+        }
+    });
+    over_cap_for(d, max, STREAMED.get(), textures())
 }
 
 /// The title's largest mips the host copy of a texture goes without.
@@ -2899,22 +2912,46 @@ mod tests {
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_over_cap_behavior() {
-        let desc = ResourceDesc {
+        let make = |width: u64, height: u32, mip_levels: u16, format: u32, flags: u32| ResourceDesc {
             dimension: 3, // TEXTURE2D
             alignment: 0,
-            width: 2048,
-            height: 2048,
+            width,
+            height,
             depth_or_array_size: 1,
-            mip_levels: 8,
-            format: 71, // BC1_UNORM
+            mip_levels,
+            format,
             sample_count: 1,
             sample_quality: 0,
             layout: 0,
-            flags: 0,
+            flags,
         };
-        // Without VICTORY_TEXTURE_MAX and without STREAMED, returns 0:
-        assert_eq!(over_cap(&desc), 0);
+
+        // Block-compressed (BC1_UNORM = 71) streamed 2048x2048:
+        let bc = make(2048, 2048, 8, 71, 0);
+        assert_eq!(over_cap_for(&bc, 512, true, Textures::Stream), 2);
+        assert_eq!(over_cap_for(&bc, 256, true, Textures::Stream), 3);
+        assert_eq!(over_cap_for(&bc, 0, true, Textures::Stream), 0);
+
+        // Uncompressed RGBA8 (28) streamed 1024x1024:
+        let rgba = make(1024, 1024, 6, 28, 0);
+        assert_eq!(over_cap_for(&rgba, 512, true, Textures::Stream), 1);
+        assert_eq!(over_cap_for(&rgba, 256, true, Textures::Stream), 2);
+
+        // Non-streamed (Committed/Placed) must NOT skip mips (CopyTextureRegion guard):
+        assert_eq!(over_cap_for(&bc, 512, false, Textures::Stream), 0);
+        assert_eq!(over_cap_for(&bc, 512, true, Textures::Keep), 0);
+
+        // Render targets, depth buffers, UAVs and single-mip textures must never skip:
+        let rt = make(2048, 2048, 8, 28, 1);
+        let ds = make(2048, 2048, 8, 28, 2);
+        let uav = make(2048, 2048, 8, 28, 4);
+        let single_mip = make(2048, 2048, 1, 71, 0);
+        assert_eq!(over_cap_for(&rt, 512, true, Textures::Stream), 0);
+        assert_eq!(over_cap_for(&ds, 512, true, Textures::Stream), 0);
+        assert_eq!(over_cap_for(&uav, 512, true, Textures::Stream), 0);
+        assert_eq!(over_cap_for(&single_mip, 512, true, Textures::Stream), 0);
     }
 }

@@ -106,6 +106,9 @@ enum Command {
         /// The console model the title sees (device type, memory).
         #[arg(long, value_enum, default_value_t = Console::SeriesX)]
         console: Console,
+        /// Profile to optimize memory usage for low-spec systems (<= 4GB VRAM, <= 20GB RAM).
+        #[arg(long)]
+        low_spec: bool,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
@@ -166,8 +169,16 @@ fn main() -> Result<()> {
             strict,
             execute,
             console,
+            low_spec,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => {
+            if low_spec {
+                // SAFETY: called on the main thread during CLI startup before
+                // any runtime or title worker threads are spawned.
+                unsafe { std::env::set_var("VICTORY_LOW_SPEC", "1") };
+            }
+            run::run(&exe, unimplemented, strict, execute, console)
+        },
         Command::Config => show_config(),
     }
 }

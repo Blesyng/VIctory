@@ -100,6 +100,17 @@ static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// the title's 60 Hz clock (which ticks many times per host frame while
 /// the host runs at 1-2 fps).
 const KEEP_FRAMES: u64 = 32;
+/// Shorter retention in low-spec mode so evicted VRAM/RAM resources are freed
+/// faster on 2–4 GiB GPUs running at low framerates.
+const KEEP_FRAMES_LOW_SPEC: u64 = 8;
+
+fn keep_frames() -> u64 {
+    if crate::low_spec() {
+        KEEP_FRAMES_LOW_SPEC
+    } else {
+        KEEP_FRAMES
+    }
+}
 
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired {
@@ -135,13 +146,14 @@ fn bury(finished: u64) {
         return;
     }
     let now = crate::queue::presented();
+    let keep = keep_frames();
     let done: Vec<Retired> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         // In the order they came: the old ones are at the front.
         let n = retired
             .iter()
             .take_while(|r| {
-                r.submission <= finished && now.saturating_sub(r.frame) >= KEEP_FRAMES
+                r.submission <= finished && now.saturating_sub(r.frame) >= keep
             })
             .count();
         retired.drain(..n).collect()
@@ -844,15 +856,24 @@ const SCRATCH_CHUNK: u64 = 512 << 10;
 /// keeping the chunks of its largest use added up to gigabytes, as the title
 /// has hundreds of lists.
 static SCRATCH_FREE: Mutex<Vec<(ID3D12Resource, usize, u64)>> = Mutex::new(Vec::new());
-/// Free chunks kept; more are released.
+/// Free chunks kept; more are released (smaller pool in low-spec mode).
 const SCRATCH_KEPT: usize = 256;
+const SCRATCH_KEPT_LOW_SPEC: usize = 32;
+
+fn scratch_kept() -> usize {
+    if crate::low_spec() {
+        SCRATCH_KEPT_LOW_SPEC
+    } else {
+        SCRATCH_KEPT
+    }
+}
 
 impl Scratch {
     fn give_back(&mut self) {
         (self.current, self.used) = (0, 0);
         let mut free = SCRATCH_FREE.lock().unwrap_or_else(|e| e.into_inner());
         free.append(&mut self.chunks);
-        let over = free.len().saturating_sub(SCRATCH_KEPT);
+        let over = free.len().saturating_sub(scratch_kept());
         let over: Vec<_> = free.drain(..over).collect();
         drop(free);
         drop(over);
