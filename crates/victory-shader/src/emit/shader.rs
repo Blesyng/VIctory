@@ -100,6 +100,8 @@ pub(crate) struct Shader {
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
+    /// Host view-heap slot cap (title + dynamic slots before memory-by-address).
+    pub own_slots: u32,
     lds: Option<V>,
     main: V,
     pub entry: usize,
@@ -158,6 +160,7 @@ impl Shader {
             threads: None,
             wave_size: None,
             lds_dwords: 0,
+            own_slots: super::OWN_SLOTS,
             lds: None,
             main,
             entry,
@@ -405,7 +408,7 @@ impl Shader {
     ) -> V {
         // An index past the heap is a fault that stops the host GPU.
         let index = if !sampler && super::limits_indices() {
-            let last = self.m.i32(super::OWN_SLOTS - 1);
+            let last = self.m.i32(self.own_slots.max(1) - 1);
             let i32t = self.t.i32;
             self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last])
         } else {

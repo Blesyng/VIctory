@@ -177,6 +177,16 @@ pub(crate) fn host_written(resource: This) {
         .insert(resource as usize);
 }
 
+/// Whether the host GPU wrote `resource` via copy/resolve (its contents live
+/// only on the host, so LRU eviction must never discard it).
+pub(crate) fn is_host_written(resource: usize) -> bool {
+    HOST_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&resource))
+}
+
 /// The runtime wrote new contents into the texture `resource`'s memory.
 pub(crate) fn rewritten(resource: usize) {
     if let Some(map) = STAGING.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
@@ -749,6 +759,7 @@ mod tests {
             skip: 0,
             written: Default::default(),
             twin: Default::default(),
+            last_used_frame: Default::default(),
             texture: resource.unwrap(),
             state: AtomicU32::new(D3D12_RESOURCE_STATE_COMMON.0 as u32),
             bytes: 0,

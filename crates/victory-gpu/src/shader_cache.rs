@@ -381,10 +381,12 @@ mod tests {
         let nvidia = Target {
             lanes_min: 32,
             lanes_max: 32,
+            own_slots: 998_976,
         };
         let rdna = Target {
             lanes_min: 32,
             lanes_max: 64,
+            own_slots: victory_shader::emit::OWN_SLOTS,
         };
         assert_eq!(key(&build, nvidia), key(&build, nvidia));
         assert_ne!(key(&build, nvidia), key(&build, rdna));

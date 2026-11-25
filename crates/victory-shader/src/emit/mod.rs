@@ -235,23 +235,28 @@ pub struct UserData {
     pub dword: u32,
 }
 
-/// The wave sizes (lanes per wave) the host GPU runs, as D3D12 reports them
-/// (`D3D12_FEATURE_DATA_D3D12_OPTIONS1::WaveLaneCountMin` / `Max`). A
-/// compute shader that declares the console's wave size translates only
-/// for a host whose range holds it: NVIDIA's range is 32..32, so a console
-/// wave64 program that reads other lanes needs 64-lane waves it cannot get.
+/// The wave sizes (lanes per wave) and view-heap slot budget the host GPU runs,
+/// as D3D12 reports them (`D3D12_FEATURE_DATA_D3D12_OPTIONS1::WaveLaneCountMin`
+/// / `Max` and `D3D12_FEATURE_DATA_D3D12_OPTIONS::ResourceBindingTier`).
+/// A compute shader that declares the console's wave size translates only for a
+/// host whose range holds it, and resource heap / stride-table indices are
+/// clamped below `own_slots` so Tier 1/2 GPUs (1,000,000-view cap) never fault.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Target {
     pub lanes_min: u32,
     pub lanes_max: u32,
+    /// Number of title + dynamic view slots in the host descriptor heap
+    /// (defaults to [`OWN_SLOTS`] for Tier 3; `998_976` for Tier 1/2 hosts).
+    pub own_slots: u32,
 }
 
 impl Target {
     /// No limit known: every wave size is taken to run (the host refuses
-    /// a pipeline it cannot run).
+    /// a pipeline it cannot run) and Tier 3 slot budget is assumed.
     pub const ANY: Target = Target {
         lanes_min: 4,
         lanes_max: 128,
+        own_slots: OWN_SLOTS,
     };
 
     /// Whether the host runs waves of `lanes`.
@@ -259,11 +264,12 @@ impl Target {
         (self.lanes_min..=self.lanes_max).contains(&lanes)
     }
 
-    /// The range as bytes, for cache keys.
-    pub fn key(self) -> [u8; 8] {
-        let mut k = [0; 8];
+    /// The target capabilities as bytes, for shader cache keys.
+    pub fn key(self) -> [u8; 12] {
+        let mut k = [0; 12];
         k[..4].copy_from_slice(&self.lanes_min.to_le_bytes());
-        k[4..].copy_from_slice(&self.lanes_max.to_le_bytes());
+        k[4..8].copy_from_slice(&self.lanes_max.to_le_bytes());
+        k[8..12].copy_from_slice(&self.own_slots.to_le_bytes());
         k
     }
 }
@@ -1072,10 +1078,12 @@ mod tests {
     const NVIDIA: Target = Target {
         lanes_min: 32,
         lanes_max: 32,
+        own_slots: OWN_SLOTS,
     };
     const RDNA: Target = Target {
         lanes_min: 32,
         lanes_max: 64,
+        own_slots: OWN_SLOTS,
     };
 
     #[test]

@@ -1098,6 +1098,7 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        s.own_slots = x.target.own_slots.max(1);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -7169,7 +7170,7 @@ impl<'a> Lower<'a> {
         let table = self.s.stride_table_handle();
         // A root view has no bounds: a wild index would read past the table.
         let slot = if super::limits_indices() || from != 0 {
-            let (i32t, last) = (self.s.t.i32, self.s.m.i32(super::OWN_SLOTS - 1));
+            let (i32t, last) = (self.s.t.i32, self.s.m.i32(self.s.own_slots.max(1) - 1));
             self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last])
         } else {
             slot

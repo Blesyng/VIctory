@@ -510,8 +510,19 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// is the title's 1,245,184 slots, these and those of [`crate::memory`].
 const DYNAMIC: u32 = 1 << 20;
 /// Smaller dynamic reserve when the host caps the whole view heap at
-/// [`PORTABLE_VIEWS`].
-const DYNAMIC_CAPPED: u32 = 1 << 16;
+/// [`PORTABLE_VIEWS`] (`VICTORY_DYNAMIC_CAPPED`, default `131_072`, clamped
+/// to `[65_536, 524_288]` so Tier 2 GPUs have room for heavy frames without
+/// starving title slots).
+fn dynamic_capped() -> u32 {
+    static CAP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_DYNAMIC_CAPPED")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(1 << 17)
+            .clamp(1 << 16, 1 << 19)
+    })
+}
 
 /// The host's limit for shader-visible sampler heaps, on every binding
 /// tier.
@@ -583,17 +594,20 @@ impl HostHeap {
             Err(e) if !sampler && count + extra + crate::memory::SLOTS > PORTABLE_VIEWS => {
                 // shortcut: descriptors past the host's limit are left out;
                 // draw::tables now remaps the root tables that reach them.
+                let dyn_cap = dynamic_capped();
+                let made = PORTABLE_VIEWS - dyn_cap - crate::memory::SLOTS;
                 tracing::warn!(
                     error = %e,
                     wanted,
-                    made = PORTABLE_VIEWS - DYNAMIC_CAPPED,
-                    lost = wanted + DYNAMIC_CAPPED - PORTABLE_VIEWS,
+                    made,
+                    dynamic = dyn_cap,
+                    lost = wanted.saturating_sub(made),
                     "host view heap capped at {PORTABLE_VIEWS}"
                 );
                 (
                     make(PORTABLE_VIEWS - crate::memory::SLOTS).ok()?,
-                    PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS,
-                    DYNAMIC_CAPPED,
+                    made,
+                    dyn_cap,
                 )
             }
             Err(e) => {
@@ -827,17 +841,46 @@ impl HostHeap {
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned), retiring any held host resources and textures outside locks
+    /// so evicted `Shadow` and `HostTexture` allocations can actually be freed.
     ///
     /// [`dynamic`]: HostHeap::dynamic
     pub(crate) fn release(&self, first: u32, n: u32) {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = at.saturating_add(n).min(self.spare) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
+        let end = at.saturating_add(n).min(self.spare);
+        let len = end.saturating_sub(at);
+        if len == 0 {
+            return;
+        }
+        let abs_start = first as usize;
+        let abs_end = (first + len) as usize;
+        let old_res: Vec<ID3D12Resource> = {
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slice) = kept.get_mut(abs_start..abs_end) {
+                slice.iter_mut().filter_map(Option::take).collect()
+            } else {
+                Vec::new()
+            }
+        };
+        let old_tex: Vec<Arc<crate::resource::HostTexture>> = {
+            let mut texs = self.kept_textures.lock().unwrap_or_else(|e| e.into_inner());
+            (first..first + len)
+                .filter_map(|idx| texs.remove(&idx))
+                .collect()
+        };
+        {
+            let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slots) = guard.1.get_mut(at as usize..end as usize) {
+                slots.fill(false);
+            }
+        }
+        if !old_res.is_empty() {
+            crate::host::retire(old_res);
+        }
+        if !old_tex.is_empty() {
+            crate::host::retire(old_tex);
         }
     }
 
@@ -931,6 +974,12 @@ impl HostHeap {
                 View::Shader(r, _) | View::Unordered(r, _, _) => {
                     crate::resource::host_copy(*r as crate::object::This)
                 }
+                View::Placed(_, _, _) => placed_texture(view).and_then(|resolved| match resolved {
+                    View::Shader(r, _) | View::Unordered(r, _, _) => {
+                        crate::resource::host_copy(r as crate::object::This)
+                    }
+                    _ => None,
+                }),
                 _ => None,
             }
         } else {

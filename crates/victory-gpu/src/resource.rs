@@ -853,6 +853,8 @@ pub(crate) struct HostTexture {
     /// Planes shaders write as images, for depth textures the title also
     /// writes so ([`crate::twin`]); made on the first such view.
     pub(crate) twin: std::sync::OnceLock<Option<crate::twin::Twin>>,
+    /// Last presented host frame this host texture was accessed (LRU clock).
+    pub(crate) last_used_frame: std::sync::atomic::AtomicU64,
 }
 
 /// Textures the host GPU writes, by the title memory they are placed in.
@@ -1071,6 +1073,10 @@ fn allocation_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resour
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
     let host = resource(this).host.as_ref()?;
+    host.last_used_frame.store(
+        crate::queue::presented(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let before = host
         .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
@@ -1085,7 +1091,13 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
-    resource(this).host.as_deref().map(|h| &h.texture)
+    resource(this).host.as_deref().map(|h| {
+        h.last_used_frame.store(
+            crate::queue::presented(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        &h.texture
+    })
 }
 
 /// The twins of a depth texture the title also writes as an image (see
@@ -1109,7 +1121,14 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.clone()
+    let copy = resource(this).host.clone();
+    if let Some(h) = copy.as_ref() {
+        h.last_used_frame.store(
+            crate::queue::presented(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    copy
 }
 
 #[cfg(windows)]
@@ -1453,6 +1472,7 @@ fn hand_out_resource(
                 skip,
                 written: Default::default(),
                 twin: Default::default(),
+                last_used_frame: std::sync::atomic::AtomicU64::new(crate::queue::presented()),
                 state: state.into(),
             })
         }),
@@ -1763,6 +1783,12 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
     {
         let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&(r, _)) = map.get(&(address, *desc)) {
+            if let Some(h) = resource(r as This).host.as_ref() {
+                h.last_used_frame.store(
+                    crate::queue::presented(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
             return Some(r as This);
         }
     }
@@ -1913,6 +1939,123 @@ pub(crate) fn evict_placed_textures(start: u64, end: u64) {
     EVICTED.fetch_add(evicted.len() as u64, std::sync::atomic::Ordering::Relaxed);
     if !evicted.is_empty() {
         PLACED_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+        for res in evicted {
+            resource_release(res as This);
+        }
+    }
+}
+
+/// Minimum idle frames before an unreferenced placed texture (> 256 KiB) is
+/// evicted under VRAM pressure (`VICTORY_PLACED_TEX_EVICT`, default `240` in
+/// low-spec mode, `0` / disabled otherwise).
+#[cfg(windows)]
+fn placed_tex_evict_frames() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        let default = if crate::low_spec() { 240 } else { 0 };
+        std::env::var("VICTORY_PLACED_TEX_EVICT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(default)
+    })
+}
+
+/// Minimum texture size (256 KiB) eligible for VRAM pressure LRU eviction:
+/// keeps small static UI icons/fonts resident to avoid flicker.
+#[cfg(windows)]
+const PLACED_EVICT_MIN_BYTES: u64 = 256 << 10;
+
+/// Pure eligibility check for safe VRAM-pressure eviction of a placed texture.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn placed_tex_is_evictable(
+    last_used: u64,
+    frame: u64,
+    threshold: u64,
+    host_strong_count: usize,
+    written: u64,
+    desc_flags: u32,
+    is_host_written: bool,
+    bytes: u64,
+) -> bool {
+    threshold > 0
+        && host_strong_count == 1
+        && written == 0
+        && (desc_flags & 7) == 0
+        && !is_host_written
+        && bytes > PLACED_EVICT_MIN_BYTES
+        && frame.saturating_sub(last_used) >= threshold
+}
+
+/// Periodically evicts idle, unreferenced `PLACED_TEXTURES` entries when VRAM
+/// usage is high (>= 70%) so 2–4 GiB GPUs do not exhaust video memory while
+/// streaming the world.
+#[cfg(windows)]
+pub(crate) fn sweep_placed(frame: u64) {
+    const EVERY: u64 = 32;
+    if !frame.is_multiple_of(EVERY) || textures() == Textures::Keep {
+        return;
+    }
+    let threshold = placed_tex_evict_frames();
+    if threshold == 0 {
+        return;
+    }
+    // Only evict under real VRAM pressure (>= 70%) to avoid unnecessary re-uploads.
+    if video_memory_percent() < 70 {
+        return;
+    }
+    let mut evicted: Vec<usize> = Vec::new();
+    let mut bytes_freed = 0u64;
+    {
+        let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let candidates: Vec<((u64, [u32; 14]), u64, u64)> = map
+            .iter()
+            .filter_map(|(&key, &(res, _))| {
+                let r = resource(res as This);
+                let host = r.host.as_ref()?;
+                let last_used = host
+                    .last_used_frame
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let written = host.written.load(std::sync::atomic::Ordering::Relaxed);
+                let ok = placed_tex_is_evictable(
+                    last_used,
+                    frame,
+                    threshold,
+                    std::sync::Arc::strong_count(host),
+                    written,
+                    r.desc.flags,
+                    crate::texture::is_host_written(res),
+                    host.bytes,
+                );
+                ok.then_some((key, last_used, host.bytes))
+            })
+            .collect();
+        if !candidates.is_empty() {
+            let mut candidates = candidates;
+            // Evict least-recently-used textures first.
+            candidates.sort_unstable_by_key(|&(_, last_used, _)| last_used);
+            let mut live = PLACED_LIVE.lock().unwrap_or_else(|e| e.into_inner());
+            for (key, _, bytes) in candidates {
+                if let Some((res, _)) = map.remove(&key) {
+                    live.remove(&res);
+                    bytes_freed = bytes_freed.saturating_add(bytes);
+                    evicted.push(res);
+                }
+            }
+            crate::memstat::PLACED_COUNT
+                .store(map.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    if !evicted.is_empty() {
+        EVICTED.fetch_add(evicted.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(
+            count = evicted.len(),
+            mib = bytes_freed >> 20,
+            frame,
+            "evicted idle placed textures under VRAM pressure (LRU)"
+        );
+        // Release outside PLACED_TEXTURES/PLACED_LIVE locks; Resource::drop
+        // retires the HostTexture via host::retire for safe GPU lifetime.
         for res in evicted {
             resource_release(res as This);
         }
@@ -2953,5 +3096,29 @@ mod tests {
         assert_eq!(over_cap_for(&ds, 512, true, Textures::Stream), 0);
         assert_eq!(over_cap_for(&uav, 512, true, Textures::Stream), 0);
         assert_eq!(over_cap_for(&single_mip, 512, true, Textures::Stream), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_placed_tex_lru_eligibility() {
+        let big = 1 << 20; // 1 MiB
+        let small_ui = 128 << 10; // 128 KiB (protected UI)
+        // Eligible: strong_count == 1, never written by GPU, no RT/DS/UAV flags, > 256 KiB, age >= threshold
+        assert!(placed_tex_is_evictable(100, 340, 240, 1, 0, 0, false, big));
+        // Disabled threshold (0)
+        assert!(!placed_tex_is_evictable(0, 1000, 0, 1, 0, 0, false, big));
+        // Still referenced by HostList / HostHeap / InFlight (strong_count > 1)
+        assert!(!placed_tex_is_evictable(0, 1000, 240, 2, 0, 0, false, big));
+        // Written by GPU (HostTexture::written != 0) or copy/resolve (HOST_WRITTEN)
+        assert!(!placed_tex_is_evictable(0, 1000, 240, 1, 1, 0, false, big));
+        assert!(!placed_tex_is_evictable(0, 1000, 240, 1, 0, 0, true, big));
+        // Render target / Depth / UAV flags
+        assert!(!placed_tex_is_evictable(0, 1000, 240, 1, 0, 1, false, big));
+        assert!(!placed_tex_is_evictable(0, 1000, 240, 1, 0, 2, false, big));
+        assert!(!placed_tex_is_evictable(0, 1000, 240, 1, 0, 4, false, big));
+        // Small UI texture protected against flicker
+        assert!(!placed_tex_is_evictable(0, 1000, 240, 1, 0, 0, false, small_ui));
+        // Too recent (age < threshold)
+        assert!(!placed_tex_is_evictable(101, 340, 240, 1, 0, 0, false, big));
     }
 }

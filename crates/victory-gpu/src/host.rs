@@ -105,11 +105,19 @@ const KEEP_FRAMES: u64 = 32;
 const KEEP_FRAMES_LOW_SPEC: u64 = 8;
 
 fn keep_frames() -> u64 {
-    if crate::low_spec() {
-        KEEP_FRAMES_LOW_SPEC
-    } else {
-        KEEP_FRAMES
-    }
+    static FRAMES: OnceLock<u64> = OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        let default = if crate::low_spec() {
+            KEEP_FRAMES_LOW_SPEC
+        } else {
+            KEEP_FRAMES
+        };
+        std::env::var("VICTORY_KEEP_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(default)
+            .clamp(2, 64)
+    })
 }
 
 /// A retired object, dropped on whatever thread finishes the submission.
@@ -861,11 +869,21 @@ const SCRATCH_KEPT: usize = 256;
 const SCRATCH_KEPT_LOW_SPEC: usize = 32;
 
 fn scratch_kept() -> usize {
-    if crate::low_spec() {
-        SCRATCH_KEPT_LOW_SPEC
-    } else {
-        SCRATCH_KEPT
-    }
+    static KEPT: OnceLock<usize> = OnceLock::new();
+    *KEPT.get_or_init(|| {
+        if let Some(mb) = std::env::var("VICTORY_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            // Scale scratch chunks (512 KiB each) at ~1/4 of VICTORY_POOL_MB.
+            return (mb / 2).clamp(16, SCRATCH_KEPT);
+        }
+        if crate::low_spec() {
+            SCRATCH_KEPT_LOW_SPEC
+        } else {
+            SCRATCH_KEPT
+        }
+    })
 }
 
 impl Scratch {
@@ -1018,18 +1036,43 @@ impl Host {
                     )
                     .is_ok()
             };
+            let mut opts0 = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            // SAFETY: the query writes the structure of the given size.
+            let ok0 = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS,
+                        (&raw mut opts0).cast(),
+                        size_of_val(&opts0) as u32,
+                    )
+                    .is_ok()
+            };
+            let tier3 = !ok0 || opts0.ResourceBindingTier.0 >= D3D12_RESOURCE_BINDING_TIER_3.0;
+            // Tier 1/2 hosts (e.g. NVIDIA) cap shader-visible view heaps at
+            // 1,000,000 descriptors (998,976 title+dynamic before memory::SLOTS).
+            let own_slots = if tier3 {
+                victory_shader::emit::OWN_SLOTS
+            } else {
+                1_000_000 - crate::memory::SLOTS
+            };
             let target = if ok && options.WaveOps.as_bool() && options.WaveLaneCountMin > 0 {
                 victory_shader::emit::Target {
                     lanes_min: options.WaveLaneCountMin,
                     lanes_max: options.WaveLaneCountMax,
+                    own_slots,
                 }
             } else {
-                victory_shader::emit::Target::ANY
+                victory_shader::emit::Target {
+                    own_slots,
+                    ..victory_shader::emit::Target::ANY
+                }
             };
             tracing::info!(
                 lanes_min = target.lanes_min,
                 lanes_max = target.lanes_max,
-                "host wave sizes"
+                own_slots = target.own_slots,
+                tier3,
+                "host shader target"
             );
             if !target.runs(64) {
                 tracing::warn!(

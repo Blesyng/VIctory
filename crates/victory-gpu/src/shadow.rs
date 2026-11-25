@@ -142,11 +142,20 @@ const TILE_POOL_MOST: usize = 8192;
 const TILE_POOL_MOST_LOW_SPEC: usize = 1024;
 
 fn tile_pool_most() -> usize {
-    if crate::low_spec() {
-        TILE_POOL_MOST_LOW_SPEC
-    } else {
-        TILE_POOL_MOST
-    }
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        if let Some(mb) = std::env::var("VICTORY_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            return ((mb << 20) / PAGE).clamp(256, TILE_POOL_MOST);
+        }
+        if crate::low_spec() {
+            TILE_POOL_MOST_LOW_SPEC
+        } else {
+            TILE_POOL_MOST
+        }
+    })
 }
 
 /// An empty buffer with room for a tile.
@@ -194,11 +203,20 @@ const POOL_BYTES: usize = 512 << 20;
 const POOL_BYTES_LOW_SPEC: usize = 64 << 20;
 
 fn pool_bytes_limit() -> usize {
-    if crate::low_spec() {
-        POOL_BYTES_LOW_SPEC
-    } else {
-        POOL_BYTES
-    }
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        if let Some(mb) = std::env::var("VICTORY_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            return (mb << 20).clamp(16 << 20, POOL_BYTES);
+        }
+        if crate::low_spec() {
+            POOL_BYTES_LOW_SPEC
+        } else {
+            POOL_BYTES
+        }
+    })
 }
 
 /// Returns a snapshot buffer to the pool (at most 8 kept, the largest,
