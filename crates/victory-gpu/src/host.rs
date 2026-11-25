@@ -2743,14 +2743,7 @@ impl Batch {
             self.pieces.push((shadow.clone(), address, end));
             return;
         }
-        match self
-            .refreshes
-            .iter_mut()
-            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
-        {
-            Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.refreshes.push((shadow.clone(), address, end)),
-        }
+        self.refreshes.push((shadow.clone(), address, end));
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -2779,8 +2772,27 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in std::mem::take(&mut self.refreshes) {
-            update(&shadow, from, to - from);
+        // Sort and coalesce non-sparse ranges per Shadow within `READ_GAP`
+        // (64 KiB) so distant reads in a large heap (e.g. 174 MiB) do not
+        // collapse into a giant bounding box copying megabytes of untouched gap.
+        const READ_GAP: usize = 64 << 10;
+        let mut refreshes = std::mem::take(&mut self.refreshes);
+        refreshes.sort_unstable_by_key(|(s, from, _)| (std::sync::Arc::as_ptr(s) as usize, *from));
+        let mut ref_run: Option<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = None;
+        for (shadow, from, to) in refreshes {
+            if let Some((s, _, end)) = &mut ref_run
+                && std::sync::Arc::ptr_eq(s, &shadow)
+                && from <= end.saturating_add(READ_GAP)
+            {
+                *end = (*end).max(to);
+                continue;
+            }
+            if let Some((s, a, b)) = ref_run.replace((shadow, from, to)) {
+                update(&s, a, b - a);
+            }
+        }
+        if let Some((s, a, b)) = ref_run {
+            update(&s, a, b - a);
         }
         let mut pieces = std::mem::take(&mut self.pieces);
         pieces.sort_unstable_by_key(|(s, from, _)| (s.root_key(), *from));

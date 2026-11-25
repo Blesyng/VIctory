@@ -96,11 +96,19 @@ pub(crate) struct State {
     /// What was set on the host list at once, for the one a cut list goes on
     /// in.
     fixed: Fixed,
-    /// What the host list has: pipeline, root signature, heaps.
+    /// What the host list has: pipeline, root signature, heaps, topology, VB/IB.
     host_pipeline: usize,
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
+    /// Last host primitive topology bound on this list (0 = unset).
+    host_topology: u32,
+    /// Last host index buffer view `(gpu, size, format)` bound on this list.
+    host_ib: Option<(u64, u32, u32)>,
+    /// Last host vertex buffer views `(gpu, size, stride)` bound on this list,
+    /// and how many slots were set.
+    host_vb: [(u64, u32, u32); 32],
+    host_vb_count: usize,
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
@@ -228,12 +236,32 @@ const LARGE: u32 = 64;
 
 /// The longest `table` of `heap` was asked for, now for `n` entries.
 fn longest(heap: &crate::descriptor::Heap, table: u64, n: u32) -> u32 {
-    static LONGEST: std::sync::Mutex<Option<std::collections::HashMap<u64, u32>>> =
-        std::sync::Mutex::new(None);
-    let mut all = LONGEST.lock().unwrap_or_else(|e| e.into_inner());
-    let most = all.get_or_insert_default().entry(table).or_insert(n);
-    *most = (*most).max(n);
-    if heap.index(table + u64::from(*most - 1) * 32).is_some() { *most } else { n }
+    use std::sync::atomic::AtomicU32;
+    type LongestMap = std::sync::RwLock<std::collections::HashMap<u64, AtomicU32>>;
+    static LONGEST: std::sync::OnceLock<LongestMap> = std::sync::OnceLock::new();
+    let map = LONGEST.get_or_init(Default::default);
+    // Fast path: shared read lock + lock-free atomic max for already-seen tables.
+    let most = {
+        let read = map.read().unwrap_or_else(|e| e.into_inner());
+        read.get(&table)
+            .map(|entry| entry.fetch_max(n, Ordering::Relaxed).max(n))
+    };
+    let most = match most {
+        Some(m) => m,
+        None => {
+            let mut write = map.write().unwrap_or_else(|e| e.into_inner());
+            write
+                .entry(table)
+                .or_insert_with(|| AtomicU32::new(n))
+                .fetch_max(n, Ordering::Relaxed)
+                .max(n)
+        }
+    };
+    if heap.index(table + u64::from(most - 1) * 32).is_some() {
+        most
+    } else {
+        n
+    }
 }
 
 /// The last byte of the root view at `address` four dwords can be read from:
@@ -290,6 +318,10 @@ impl State {
             }
             t => t,
         };
+        if self.host_topology == host {
+            return;
+        }
+        self.host_topology = host;
         // SAFETY: an open list.
         unsafe {
             list.list
@@ -393,6 +425,9 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        self.host_topology = 0;
+        self.host_ib = None;
+        self.host_vb_count = 0;
         // Making one refreshes what it names, which is each list's own work.
         self.fresh_tables.clear();
         self.large_tables.clear();
@@ -413,6 +448,30 @@ impl State {
         }
         if let Some((targets, depth)) = self.fixed.views.take() {
             self.bind_targets(list, targets, depth);
+        }
+    }
+
+    /// Restores host list state after an inline helper pass (`twin::resolve`
+    /// and/or `ambient::raise`) on the SAME `HostList`, preserving `fresh_tables`
+    /// and `large_tables` so dynamic descriptor allocations are not wasted.
+    fn restore_after_helper(&mut self, list: &HostList, touched_graphics: bool) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+        if touched_graphics {
+            self.host_topology = 0;
+            if self.topology != 0 {
+                self.set_topology(list, self.topology);
+            }
+            if !self.fixed.viewports.is_empty() {
+                viewports(list, &self.fixed.viewports);
+            }
+            if !self.fixed.scissors.is_empty() {
+                scissors(list, &self.fixed.scissors);
+            }
+            if let Some((targets, depth)) = self.fixed.views.take() {
+                self.bind_targets(list, targets, depth);
+            }
         }
     }
 
@@ -644,8 +703,14 @@ impl State {
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
+        let mut keys = [(0u64, 0u32, 0u32); 32];
         let mut count = 0;
-        for (slot, (view, &v)) in views.iter_mut().zip(&self.vertex).enumerate() {
+        for (slot, ((view, key), &v)) in views
+            .iter_mut()
+            .zip(keys.iter_mut())
+            .zip(&self.vertex)
+            .enumerate()
+        {
             if p.slots & 1 << slot == 0 {
                 continue;
             }
@@ -657,15 +722,19 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            let loc = shadow.gpu(v.address);
             *view = D3D12_VERTEX_BUFFER_VIEW {
-                BufferLocation: shadow.gpu(v.address),
+                BufferLocation: loc,
                 SizeInBytes: v.size,
                 StrideInBytes: v.stride,
             };
+            *key = (loc, v.size, v.stride);
         }
-        // SAFETY: an open list; the views name live host buffers.
-        unsafe {
-            if count > 0 {
+        if count > 0 && (self.host_vb_count != count || self.host_vb[..count] != keys[..count]) {
+            self.host_vb[..count].copy_from_slice(&keys[..count]);
+            self.host_vb_count = count;
+            // SAFETY: an open list; the views name live host buffers.
+            unsafe {
                 l.IASetVertexBuffers(0, Some(&views[..count]));
             }
         }
@@ -675,25 +744,33 @@ impl State {
                 return no("no index buffer");
             };
             shadow.refresh(list, v.address, u64::from(v.size));
-            let view = D3D12_INDEX_BUFFER_VIEW {
-                BufferLocation: shadow.gpu(v.address),
-                SizeInBytes: v.size,
-                Format: DXGI_FORMAT(v.format as i32),
-            };
-            // SAFETY: an open list; the view names a live host buffer.
-            unsafe { l.IASetIndexBuffer(Some(&view)) };
+            let loc = shadow.gpu(v.address);
+            let ib_key = (loc, v.size, v.format);
+            if self.host_ib != Some(ib_key) {
+                self.host_ib = Some(ib_key);
+                let view = D3D12_INDEX_BUFFER_VIEW {
+                    BufferLocation: loc,
+                    SizeInBytes: v.size,
+                    Format: DXGI_FORMAT(v.format as i32),
+                };
+                // SAFETY: an open list; the view names a live host buffer.
+                unsafe { l.IASetIndexBuffer(Some(&view)) };
+            }
         }
         const RENDER_TARGET: u32 = 0x4;
         const DEPTH_WRITE: u32 = 0x10;
-        let mut transitions: Vec<(This, u32)> = Vec::with_capacity(self.targets.len() + 1);
-        for &t in &self.targets {
-            transitions.push((t as This, RENDER_TARGET));
+        let mut transitions = [(std::ptr::null(), 0u32); 9];
+        let mut tcount = 0usize;
+        for &t in self.targets.iter().take(8) {
+            transitions[tcount] = (t as This, RENDER_TARGET);
+            tcount += 1;
         }
         if self.depth != 0 {
-            transitions.push((self.depth as This, DEPTH_WRITE));
+            transitions[tcount] = (self.depth as This, DEPTH_WRITE);
+            tcount += 1;
         }
-        if !transitions.is_empty() {
-            crate::list::ensure_states(list, &transitions);
+        if tcount > 0 {
+            crate::list::ensure_states(list, &transitions[..tcount]);
         }
         true
     }
@@ -774,7 +851,14 @@ impl State {
                 return no("a table not made");
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                let mut stack_buf = [0u32; 64];
+                let mut heap_buf: Vec<u32> = Vec::new();
+                let values: &mut [u32] = if (dwords as usize) <= stack_buf.len() {
+                    &mut stack_buf[..dwords as usize]
+                } else {
+                    heap_buf.resize(dwords as usize, 0);
+                    &mut heap_buf
+                };
                 for u in &t.host.user_data {
                     let fresh = made
                         .iter()
@@ -955,10 +1039,11 @@ impl State {
         list.count_work();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         // Depth textures it wrote as images get what it wrote; then the
-        // title's state goes back on the list.
+        // title's state goes back on the list without wiping fresh/large tables.
         let lit = self.ambient(list, p);
-        if crate::twin::resolve(list) | lit {
-            self.continue_in(list);
+        let twinned = crate::twin::resolve(list);
+        if twinned || lit {
+            self.restore_after_helper(list, twinned);
         }
     }
 
@@ -1432,7 +1517,7 @@ impl State {
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
-    fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
+    fn rectangles(&mut self, list: &HostList, count: u32, first: u32) -> bool {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
@@ -1481,6 +1566,7 @@ impl State {
             };
             // SAFETY: an open list; the view names live scratch memory.
             unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
+            self.host_vb_count = 0;
         }
         true
     }
@@ -1730,6 +1816,9 @@ impl State {
                         // SAFETY: an open list; the view names a buffer the list keeps.
                         unsafe { list.list.IASetVertexBuffers(*slot, Some(&[*view])) };
                     }
+                    if !rect_vertices.is_empty() {
+                        self.host_vb_count = 0;
+                    }
                 }
                 ok
             }
@@ -1821,7 +1910,7 @@ impl State {
             list.count_work();
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
             if crate::twin::resolve(list) {
-                self.continue_in(list);
+                self.restore_after_helper(list, true);
             }
         } else {
             list.count_work();

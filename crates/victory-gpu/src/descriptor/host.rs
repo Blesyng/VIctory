@@ -39,8 +39,8 @@ pub(crate) struct HostHeap {
     /// a shader-visible descriptor slot still points into it.
     kept_textures: Mutex<HashMap<u32, Arc<crate::resource::HostTexture>>>,
     /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    /// (by lists not yet reset), stored as a 64-bit word bitset.
+    next: Mutex<DynamicSlots>,
     /// Per-slot element byte stride (`u32`) for structured buffers whose
     /// stride shader analysis could not recover statically.
     strides: Option<StrideTable>,
@@ -61,6 +61,114 @@ pub(crate) struct HostHeap {
     rewrites_seen: AtomicU64,
     /// The views of memory by address made ([`crate::memory::fill`]).
     memory_seen: Mutex<u64>,
+}
+
+/// Compact 64-bit word bitset for dynamic descriptor slot allocation.
+/// Skips 64 occupied or free slots per CPU instruction (`u64::MAX` / `0` /
+/// `trailing_ones` / `trailing_zeros`) while preserving non-wrapping
+/// contiguous allocation semantics.
+struct DynamicSlots {
+    cursor: usize,
+    len: usize,
+    words: Vec<u64>,
+    used: usize,
+}
+
+impl DynamicSlots {
+    fn new(len: usize) -> Self {
+        Self {
+            cursor: 0,
+            len,
+            words: vec![0u64; len.div_ceil(64)],
+            used: 0,
+        }
+    }
+
+    fn find_in_range(&self, start: usize, end: usize, n: usize) -> Option<usize> {
+        let mut i = start;
+        let mut run = 0usize;
+        while i < end {
+            if (i & 63) == 0 && i + 64 <= end {
+                let w = self.words[i >> 6];
+                if w == 0 {
+                    run += 64;
+                    if run >= n {
+                        return Some(i + 64 - run);
+                    }
+                    i += 64;
+                    continue;
+                }
+                if w == u64::MAX {
+                    run = 0;
+                    i += 64;
+                    continue;
+                }
+            }
+            let bit = i & 63;
+            let avail = (64 - bit).min(end - i);
+            let shifted = self.words[i >> 6] >> bit;
+            if (shifted & 1) != 0 {
+                let ones = (shifted.trailing_ones() as usize).min(avail);
+                run = 0;
+                i += ones;
+            } else {
+                let zeros = (shifted.trailing_zeros() as usize).min(avail);
+                run += zeros;
+                if run >= n {
+                    return Some(i + zeros - run);
+                }
+                i += zeros;
+            }
+        }
+        None
+    }
+
+    fn set_range(&mut self, start: usize, len: usize, value: bool) {
+        let end = (start + len).min(self.len);
+        let mut i = start;
+        while i < end {
+            let word_idx = i >> 6;
+            let bit = i & 63;
+            let count = (64 - bit).min(end - i);
+            let mask = if count == 64 {
+                u64::MAX
+            } else {
+                ((1u64 << count) - 1) << bit
+            };
+            let w = &mut self.words[word_idx];
+            if value {
+                let newly_set = (!*w & mask).count_ones() as usize;
+                *w |= mask;
+                self.used += newly_set;
+            } else {
+                let newly_cleared = (*w & mask).count_ones() as usize;
+                *w &= !mask;
+                self.used = self.used.saturating_sub(newly_cleared);
+            }
+            i += count;
+        }
+    }
+
+    fn alloc(&mut self, n: usize) -> Option<usize> {
+        if n == 0 || n > self.len || self.used + n > self.len {
+            return None;
+        }
+        let first = self.find_in_range(self.cursor, self.len, n).or_else(|| {
+            if self.cursor > 0 {
+                let wrap_end = self.cursor.saturating_add(n - 1).min(self.len);
+                self.find_in_range(0, wrap_end, n)
+            } else {
+                None
+            }
+        })?;
+        self.set_range(first, n, true);
+        self.cursor = (first + n) % self.len;
+        Some(first)
+    }
+
+    fn free(&mut self, start: usize, len: usize) {
+        self.set_range(start, len, false);
+    }
 }
 
 /// The dword of the stride table the element counts start at.
@@ -667,7 +775,7 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             kept_textures: Mutex::default(),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new(DynamicSlots::new(extra as usize)),
             strides,
             bindless: Mutex::default(),
             recording: std::sync::atomic::AtomicBool::new(false),
@@ -803,42 +911,28 @@ impl HostHeap {
             return None;
         }
         let spare = self.spare as usize;
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
-        let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..spare).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
-        let Some(first) = found else {
+        let mut slots = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let n_usize = n as usize;
+        let Some(first) = slots.alloc(n_usize) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, spare, "no free dynamic descriptor slots: a table is not made"));
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    n = n_usize,
+                    spare,
+                    "no free dynamic descriptor slots: a table is not made"
+                )
+            });
             return None;
         };
-        taken[first..first + n].fill(true);
         #[cfg(feature = "diagnostics")]
         if !self.sampler {
             static MADE: AtomicU64 = AtomicU64::new(0);
             let before = MADE.fetch_add(n as u64, Ordering::Relaxed);
             if before >> 20 != (before + n as u64) >> 20 {
-                let used = taken.iter().filter(|t| **t).count();
+                let used = slots.used;
                 tracing::info!(used, spare, "dynamic descriptor slots");
             }
         }
-        *next = ((first + n) % spare) as u32;
         Some(self.count + first as u32)
     }
 
@@ -879,10 +973,8 @@ impl HostHeap {
                 .collect()
         };
         {
-            let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(slots) = guard.1.get_mut(at as usize..end as usize) {
-                slots.fill(false);
-            }
+            let mut slots = self.next.lock().unwrap_or_else(|e| e.into_inner());
+            slots.free(at as usize, len as usize);
         }
         if !old_res.is_empty() {
             crate::host::retire(old_res);
@@ -3663,5 +3755,36 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Clean up `addr_b` too.
         crate::watch::title_memory_remapped(addr_b as usize, 64 << 10);
         assert!(!crate::resource::has_placed_texture(addr_b, &desc));
+    }
+
+    #[test]
+    fn test_dynamic_slots_bitset_wraparound() {
+        let spare = 300usize;
+        let mut s = DynamicSlots::new(spare);
+        assert_eq!(s.alloc(0), None);
+        assert_eq!(s.alloc(spare + 1), None);
+
+        // Mirrors `dynamic_slots_are_held_until_released` without requiring D3D12 host:
+        let a = s.alloc(spare - 100).unwrap();
+        assert_eq!(a, 0);
+        let b = s.alloc(60).unwrap();
+        assert_eq!(b, spare - 100);
+        assert_eq!(s.used, spare - 40);
+        // Only 40 free at the tail -> 50 must fail (cannot wrap across spare - 1 -> 0).
+        assert_eq!(s.alloc(50), None);
+        // Free first 50 slots and allocate 50 -> wraps to 0.
+        s.free(a, 50);
+        assert_eq!(s.used, spare - 90);
+        assert_eq!(s.alloc(50), Some(0));
+        // Tail 40 slots are still found cleanly across 64-bit word boundaries.
+        assert_eq!(s.alloc(40), Some(spare - 40));
+        assert_eq!(s.used, spare);
+        assert_eq!(s.alloc(1), None);
+
+        // Test a free run straddling `cursor` across multiple 64-bit words:
+        s.free(50, 150); // [50..200)
+        s.cursor = 128; // inside the free run
+        assert_eq!(s.alloc(140), Some(50));
+        assert_eq!(s.used, spare - 10);
     }
 }
