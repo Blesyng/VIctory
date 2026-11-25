@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+mod launcher;
+mod profile;
 mod run;
 mod shader;
 mod translate;
@@ -22,7 +24,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -116,6 +118,11 @@ enum Command {
     },
     /// Show the resolved configuration and check it.
     Config,
+    /// Open the interactive hardware selector UI (VRAM / RAM / Console).
+    Launcher {
+        /// Optional pre-filled game executable path.
+        exe: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -138,7 +145,22 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
-    match cli.command {
+    let Some(command) = cli.command else {
+        if let Some(profile) = launcher::show(None)? {
+            profile.apply_env();
+            if let Some(exe) = profile.exe {
+                return run::run(
+                    &exe,
+                    Unimplemented::Trap,
+                    false,
+                    true,
+                    profile.console.into(),
+                );
+            }
+        }
+        return Ok(());
+    };
+    match command {
         Command::Inspect {
             file,
             imports,
@@ -178,8 +200,23 @@ fn main() -> Result<()> {
                 unsafe { std::env::set_var("VICTORY_LOW_SPEC", "1") };
             }
             run::run(&exe, unimplemented, strict, execute, console)
-        },
+        }
         Command::Config => show_config(),
+        Command::Launcher { exe } => {
+            if let Some(profile) = launcher::show(exe)? {
+                profile.apply_env();
+                if let Some(exe) = profile.exe {
+                    return run::run(
+                        &exe,
+                        Unimplemented::Trap,
+                        false,
+                        true,
+                        profile.console.into(),
+                    );
+                }
+            }
+            Ok(())
+        }
     }
 }
 
