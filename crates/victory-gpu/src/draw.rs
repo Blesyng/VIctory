@@ -73,6 +73,24 @@ pub(crate) struct Hoist {
     pub(crate) writes: u64,
 }
 
+/// Cached dynamic descriptor table allocated in the current `HostList`, with an
+/// epoch-validated SRV readiness bitmask (`srv_mask`) so repeated draws in the
+/// same render pass skip redundant `descriptor::view` / `readable` lock lookups.
+#[derive(Clone, Copy)]
+struct FreshTable {
+    first: u32,
+    srv_epoch: u64,
+    srv_mask: u64,
+}
+
+/// Cached large dynamic descriptor table (`>= LARGE` entries) reused by prefix.
+struct LargeTable {
+    records: Vec<[u32; 3]>,
+    first: u32,
+    srv_epoch: u64,
+    srv_mask: u64,
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -109,12 +127,16 @@ pub(crate) struct State {
     /// and how many slots were set.
     host_vb: [(u64, u32, u32); 32],
     host_vb_count: usize,
-    /// Tables made afresh in this list: (table, what it holds) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    /// Tables made afresh in this list: (table, what it holds) → slot + SRV cache.
+    fresh_tables: std::collections::HashMap<(u64, u64), FreshTable>,
     /// Of them, large ones by table: the records it was made from and the
     /// first dynamic slot. A shader that reads less of one takes the same.
-    large_tables: std::collections::HashMap<u64, Vec<(Vec<[u32; 3]>, u32)>>,
+    large_tables: std::collections::HashMap<u64, Vec<LargeTable>>,
+    /// Reusable per-draw scratch buffers for `State::tables` (zero steady-state
+    /// heap allocations across draws).
+    scratch_made: Vec<(u8, u32)>,
+    scratch_entries: Vec<usize>,
+    scratch_records: Vec<[u32; 3]>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -415,6 +437,7 @@ impl State {
     /// Ends and closes the list of hoisted clamps, if any.
     pub(crate) fn end_hoist(&mut self) {
         if let Some(h) = self.hoist.take() {
+            crate::indirect::finish_hoisted(&h.clamps);
             h.clamps.clamp_end();
             h.clamps.close();
         }
@@ -455,6 +478,7 @@ impl State {
     /// and/or `ambient::raise`) on the SAME `HostList`, preserving `fresh_tables`
     /// and `large_tables` so dynamic descriptor allocations are not wasted.
     fn restore_after_helper(&mut self, list: &HostList, touched_graphics: bool) {
+        list.bump_state_epoch();
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
@@ -797,16 +821,19 @@ impl State {
             return no("no view of memory");
         }
         if self.host_heaps != self.heaps && !(by_address && self.heaps[0] == 0) {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
+            let mut heaps: [Option<ID3D12DescriptorHeap>; 2] = [None, None];
+            let mut hcount = 0usize;
+            for &h in &self.heaps {
+                if h != 0
+                    && let Some(host_heap) = crate::descriptor::heap(h as This).host()
+                {
+                    list.keep(&host_heap.heap);
+                    heaps[hcount] = Some(host_heap.heap.clone());
+                    hcount += 1;
+                }
+            }
             // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
+            unsafe { l.SetDescriptorHeaps(&heaps[..hcount]) };
             self.host_heaps = self.heaps;
             self.host_roots = [0; 2];
         }
@@ -847,9 +874,9 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
-            let Some(made) = self.tables(list, &t.used, compute) else {
+            if !self.tables(list, &t.used, compute) {
                 return no("a table not made");
-            };
+            }
             if let Some((param, dwords)) = stage.user_data {
                 let mut stack_buf = [0u32; 64];
                 let mut heap_buf: Vec<u32> = Vec::new();
@@ -860,7 +887,8 @@ impl State {
                     &mut heap_buf
                 };
                 for u in &t.host.user_data {
-                    let fresh = made
+                    let fresh = self
+                        .scratch_made
                         .iter()
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     if u.root == RootType::MEMORY {
@@ -1218,28 +1246,42 @@ impl State {
     /// recorded draw samples. Constants also get 256-byte-aligned storage,
     /// filled at submission (the host wants constant buffers 256-byte
     /// aligned, the console only 16). Identical descriptors share slots
-    /// within a list. Returns the fresh tables' new byte offsets by root
-    /// parameter, or `None` when the draw must be dropped (a constant table
-    /// found no dynamic slots).
-    fn tables(
-        &mut self,
-        list: &HostList,
-        used: &[UsedResource],
-        compute: bool,
-    ) -> Option<Vec<(u8, u32)>> {
-        let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| matches!(u.kind, ResourceType::Cbv | ResourceType::Srv))
-            .map(|u| u.slot)
-            .collect();
+    /// within a list. Populates `self.scratch_made` with the fresh tables' new
+    /// byte offsets by root parameter and returns `false` when the draw must
+    /// be dropped (a constant table found no dynamic slots).
+    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> bool {
+        self.scratch_made.clear();
+        let mut fresh_mask: u64 = 0;
+        let mut fresh_extra: Vec<u8> = Vec::new();
+        let add_fresh = |slot: u8, mask: &mut u64, extra: &mut Vec<u8>| {
+            if slot < 64 {
+                *mask |= 1u64 << slot;
+            } else if !extra.contains(&slot) {
+                extra.push(slot);
+            }
+        };
+        let is_fresh = |slot: u8, mask: u64, extra: &[u8]| -> bool {
+            if slot < 64 {
+                (mask & (1u64 << slot)) != 0
+            } else {
+                extra.contains(&slot)
+            }
+        };
+
+        for u in used {
+            if u.root != RootType::Table {
+                continue;
+            }
+            if matches!(u.kind, ResourceType::Cbv | ResourceType::Srv) {
+                add_fresh(u.slot, &mut fresh_mask, &mut fresh_extra);
+            }
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA, 2,048 samplers anywhere)
         // are made afresh too: the title's slots there have no host slot of
         // their own.
-        for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
+        for u in used {
+            if u.root != RootType::Table || is_fresh(u.slot, fresh_mask, &fresh_extra) {
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
@@ -1253,127 +1295,218 @@ impl State {
                 continue;
             };
             if index >= host.count() {
-                fresh.push(u.slot);
+                add_fresh(u.slot, &mut fresh_mask, &mut fresh_extra);
             }
         }
-        fresh.sort_unstable();
-        fresh.dedup();
-        for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
+        if !fresh_extra.is_empty() {
+            fresh_extra.sort_unstable();
+        }
+        for u in used {
+            if u.root == RootType::Table && !is_fresh(u.slot, fresh_mask, &fresh_extra) {
                 self.table_entry(list, u, compute);
             }
         }
-        let mut made = Vec::new();
-        for slot in fresh {
+
+        let mut remaining_mask = fresh_mask;
+        let mut extra_idx = 0usize;
+        while remaining_mask != 0 || extra_idx < fresh_extra.len() {
+            let slot = if remaining_mask != 0 {
+                let s = remaining_mask.trailing_zeros() as u8;
+                remaining_mask &= remaining_mask - 1;
+                s
+            } else {
+                let s = fresh_extra[extra_idx];
+                extra_idx += 1;
+                s
+            };
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
-                .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
+            self.scratch_entries.clear();
+            let mut max_entry_n = 1u32;
+            for (idx, u) in used.iter().enumerate() {
+                if u.root == RootType::Table && u.slot == slot {
+                    self.scratch_entries.push(idx);
+                    max_entry_n = max_entry_n.max(u.table_offset_dwords / 8 + 1);
+                }
+            }
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
             let Some(host) = heap.host() else {
                 continue;
             };
-            let n = entries
-                .iter()
-                .map(|u| u.table_offset_dwords / 8 + 1)
-                .max()
-                .unwrap_or(1);
-            let last = table + u64::from(n - 1) * 32;
+            let needed = max_entry_n as usize;
+            let last = table + u64::from(max_entry_n - 1) * 32;
             // Shaders read such a table to many lengths, and a copy for each
             // ran out of slots: the longest seen serves all.
-            let n = if n >= LARGE { longest(heap, table, n) } else { n };
+            let n = if max_entry_n >= LARGE {
+                longest(heap, table, max_entry_n)
+            } else {
+                max_entry_n
+            };
             if heap.index(last).is_none() {
-                for u in entries {
+                for i in 0..self.scratch_entries.len() {
+                    let u = &used[self.scratch_entries[i]];
                     self.table_entry(list, u, compute);
                 }
                 continue;
             }
-            let records: Vec<[u32; 3]> = if n >= LARGE {
-                (0..n)
+            if n >= LARGE {
+                self.scratch_records.clear();
+                self.scratch_records.reserve(needed);
+                for k in 0..needed {
                     // SAFETY: descriptor slots in title memory.
-                    .map(|k| unsafe {
-                        ((table + u64::from(k) * 32) as *const [u32; 3]).read_unaligned()
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let needed = entries
-                .iter()
-                .map(|u| u.table_offset_dwords as usize / 8 + 1)
-                .max()
-                .unwrap_or(1);
-            let same = self.large_tables.get(&table).and_then(|made| {
-                made.iter()
-                    .find(|(r, _)| r.len() >= needed && r[..needed] == records[..needed.min(records.len())])
-                    .map(|&(_, first)| first)
-            });
-            if n >= LARGE
-                && let Some(first) = same
-            {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
-                    let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    match crate::descriptor::view(handle) {
-                        Some(view) => readable(list, u, &view),
-                        None => self.null_uav |= u.kind == ResourceType::Uav,
-                    }
+                    let rec = unsafe {
+                        ((table + (k as u64) * 32) as *const [u32; 3]).read_unaligned()
+                    };
+                    self.scratch_records.push(rec);
                 }
-                made.push((slot, first * 32));
-                continue;
+                let hit_idx = self.large_tables.get(&table).and_then(|made| {
+                    made.iter().position(|entry| {
+                        entry.records.len() >= needed
+                            && entry.records[..needed] == self.scratch_records[..needed]
+                    })
+                });
+                if let Some(hit_idx) = hit_idx {
+                    let epoch = list.state_epoch();
+                    let (first, mut srv_mask) = {
+                        let entry = &mut self.large_tables.get_mut(&table).unwrap()[hit_idx];
+                        if entry.srv_epoch != epoch {
+                            entry.srv_epoch = epoch;
+                            entry.srv_mask = 0;
+                        }
+                        (entry.first, entry.srv_mask)
+                    };
+                    let mut saw_uav = false;
+                    for &idx in &self.scratch_entries {
+                        let u = &used[idx];
+                        if u.kind == ResourceType::Cbv {
+                            continue;
+                        }
+                        let k = u.table_offset_dwords / 8;
+                        if u.kind == ResourceType::Srv && k < 64 && (srv_mask & (1u64 << k)) != 0 {
+                            continue;
+                        }
+                        let handle = table + u64::from(u.table_offset_dwords) * 4;
+                        match crate::descriptor::view(handle) {
+                            Some(view) => {
+                                readable(list, u, &view);
+                                if u.kind == ResourceType::Srv && k < 64 {
+                                    srv_mask |= 1u64 << k;
+                                } else if u.kind == ResourceType::Uav {
+                                    saw_uav = true;
+                                }
+                            }
+                            None => self.null_uav |= u.kind == ResourceType::Uav,
+                        }
+                    }
+                    let entry = &mut self.large_tables.get_mut(&table).unwrap()[hit_idx];
+                    if saw_uav {
+                        entry.srv_mask = 0;
+                    } else {
+                        entry.srv_epoch = list.state_epoch();
+                        entry.srv_mask = srv_mask;
+                    }
+                    self.scratch_made.push((slot, first * 32));
+                    continue;
+                }
+                // Fill the remaining `needed..n` records once for hashing and insertion.
+                self.scratch_records.reserve((n as usize).saturating_sub(needed));
+                for k in needed..(n as usize) {
+                    // SAFETY: descriptor slots in title memory.
+                    let rec = unsafe {
+                        ((table + (k as u64) * 32) as *const [u32; 3]).read_unaligned()
+                    };
+                    self.scratch_records.push(rec);
+                }
             }
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                if n >= LARGE {
+                    for rec in &self.scratch_records {
+                        rec.hash(&mut h);
+                    }
+                } else {
+                    for k in 0..n {
+                        let at = table + u64::from(k) * 32;
+                        // SAFETY: a descriptor slot in title memory.
+                        unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    }
                 }
                 (table, h.finish())
             };
-            if let Some(&first) = self.fresh_tables.get(&key) {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+            if let Some(&ft) = self.fresh_tables.get(&key) {
+                let epoch = list.state_epoch();
+                let mut srv_mask = if ft.srv_epoch == epoch { ft.srv_mask } else { 0 };
+                let mut saw_uav = false;
+                for &idx in &self.scratch_entries {
+                    let u = &used[idx];
+                    if u.kind == ResourceType::Cbv {
+                        continue;
+                    }
+                    let k = u.table_offset_dwords / 8;
+                    if u.kind == ResourceType::Srv && k < 64 && (srv_mask & (1u64 << k)) != 0 {
+                        continue;
+                    }
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     match crate::descriptor::view(handle) {
-                        Some(view) => readable(list, u, &view),
+                        Some(view) => {
+                            readable(list, u, &view);
+                            if u.kind == ResourceType::Srv && k < 64 {
+                                srv_mask |= 1u64 << k;
+                            } else if u.kind == ResourceType::Uav {
+                                saw_uav = true;
+                            }
+                        }
                         None => self.null_uav |= u.kind == ResourceType::Uav,
                     }
                 }
-                made.push((slot, first * 32));
+                if let Some(ft_mut) = self.fresh_tables.get_mut(&key) {
+                    if saw_uav {
+                        ft_mut.srv_mask = 0;
+                    } else {
+                        ft_mut.srv_epoch = list.state_epoch();
+                        ft_mut.srv_mask = srv_mask;
+                    }
+                }
+                self.scratch_made.push((slot, ft.first * 32));
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
                 // A table holding constants made from the title's slots
                 // would view them misaligned: the draw is dropped. Other
                 // tables fall back to the title's slots.
-                if entries.iter().any(|u| u.kind == ResourceType::Cbv) {
+                if self
+                    .scratch_entries
+                    .iter()
+                    .any(|&idx| used[idx].kind == ResourceType::Cbv)
+                {
                     once!(n, "a constant table did not fit in command-list slots; draw dropped");
-                    return None;
+                    return false;
                 }
                 once!(n, "descriptor table did not fit in command-list slots");
-                for u in entries {
+                for i in 0..self.scratch_entries.len() {
+                    let u = &used[self.scratch_entries[i]];
                     self.table_entry(list, u, compute);
                 }
                 continue;
             };
-            self.fresh_tables.insert(key, first);
-            if n >= LARGE {
-                self.large_tables.entry(table).or_default().push((records, first));
-            }
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
+            let mut initial_srv_mask = 0u64;
+            let mut saw_uav = false;
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                let entry_used = self
+                    .scratch_entries
+                    .iter()
+                    .map(|&idx| &used[idx])
+                    .find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
@@ -1385,12 +1518,17 @@ impl State {
                     }
                     Some(view) => {
                         host.make_at(index, &view);
-                        if let Some(u) = used {
+                        if let Some(u) = entry_used {
                             readable(list, u, &view);
+                            if u.kind == ResourceType::Srv && k < 64 {
+                                initial_srv_mask |= 1u64 << k;
+                            } else if u.kind == ResourceType::Uav {
+                                saw_uav = true;
+                            }
                         }
                     }
                     None => {
-                        if let Some(u) = used {
+                        if let Some(u) = entry_used {
                             host.make_null_kind(index, u.kind, u.dwords);
                             once!(slot, "a table entry without a view");
                             self.null_uav |= u.kind == ResourceType::Uav;
@@ -1400,9 +1538,27 @@ impl State {
                     }
                 }
             }
-            made.push((slot, first * 32));
+            let post_epoch = list.state_epoch();
+            let cached_mask = if saw_uav { 0 } else { initial_srv_mask };
+            self.fresh_tables.insert(
+                key,
+                FreshTable {
+                    first,
+                    srv_epoch: post_epoch,
+                    srv_mask: cached_mask,
+                },
+            );
+            if n >= LARGE {
+                self.large_tables.entry(table).or_default().push(LargeTable {
+                    records: self.scratch_records.clone(),
+                    first,
+                    srv_epoch: post_epoch,
+                    srv_mask: cached_mask,
+                });
+            }
+            self.scratch_made.push((slot, first * 32));
         }
-        Some(made)
+        true
     }
 
     /// The first draws, at debug level: what they bind and read

@@ -117,9 +117,201 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-struct Clamp {
+const HOIST_PASS1: &str = r#"
+#define RS "RootConstants(num32BitConstants=7, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+cbuffer Record : register(b0) {
+    uint kind;
+    uint stride;
+    uint records;
+    uint args_offset;
+    uint has_count;
+    uint count_offset;
+    uint slot_idx;
+};
+ByteAddressBuffer src_args : register(t0);
+ByteAddressBuffer count_buf : register(t1);
+RWByteAddressBuffer dst_args : register(u0);
+// Per-clamp slot: uint4(cost, eff_count, prefix, 0) at slot_idx * 16.
+RWByteAddressBuffer slots : register(u1);
+static const uint BUDGET = 1u << 27;
+static const uint CAP = BUDGET + 1u;
+static const uint GROUPS = 1u << 20;
+groupshared uint g_cost[64];
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID, uint3 gtid3 : SV_GroupThreadID) {
+    uint gtid = gtid3.x;
+    uint eff_count = records;
+    if (has_count != 0) {
+        eff_count = min(eff_count, count_buf.Load(count_offset));
+    }
+    if (id.x == 0) {
+        slots.Store(slot_idx * 16 + 4, eff_count);
+    }
+    uint cost = 0;
+    if (id.x < eff_count) {
+        uint src_at = args_offset + id.x * stride;
+        uint dst_at = id.x * stride;
+        if (kind <= 1) {
+            uint count = min(src_args.Load(src_at), 1u << 24);
+            uint instances = min(src_args.Load(src_at + 4), (1u << 26) / max(count, 1u));
+            cost = count * instances;
+            dst_args.Store2(dst_at, uint2(count, instances));
+            for (uint off = 8; off < stride; off += 4) {
+                dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            }
+        } else if (kind == 2) {
+            uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+            if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+                g = uint3(0, 0, 0);
+            }
+            cost = g.x * g.y * g.z * 64u;
+            dst_args.Store3(dst_at, g);
+            for (uint off = 12; off < stride; off += 4) {
+                dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            }
+        } else {
+            uint3 g = src_args.Load3(src_at);
+            g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+            cost = g.x * g.y * g.z * 128u;
+            dst_args.Store3(dst_at, g);
+            for (uint off = 12; off < stride; off += 4) {
+                dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            }
+        }
+    }
+    g_cost[gtid] = cost;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (gtid < s) {
+            uint a = g_cost[gtid];
+            uint b = g_cost[gtid + s];
+            g_cost[gtid] = (CAP - a <= b) ? CAP : (a + b);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gtid == 0) {
+        uint sum = g_cost[0];
+        if (records <= 64u) {
+            slots.Store(slot_idx * 16, sum);
+        } else if (sum > 0u) {
+            uint before;
+            slots.InterlockedOr(slot_idx * 16, 0, before);
+            bool settled = false;
+            [allow_uav_condition]
+            for (uint tries = 0; tries < 256 && before < CAP; tries++) {
+                uint next = (CAP - before <= sum) ? CAP : (before + sum);
+                uint prev;
+                slots.InterlockedCompareExchange(slot_idx * 16, before, next, prev);
+                if (prev == before) { settled = true; break; }
+                before = prev;
+            }
+            if (!settled && before < CAP) {
+                uint dummy;
+                slots.InterlockedMax(slot_idx * 16, CAP, dummy);
+            }
+        }
+    }
+}
+"#;
+
+const HOIST_PREFIX: &str = r#"
+#define RS "RootConstants(num32BitConstants=1, b0), UAV(u0)"
+cbuffer Info : register(b0) {
+    uint num_clamps;
+};
+RWByteAddressBuffer slots : register(u0);
+static const uint BUDGET = 1u << 27;
+static const uint CAP = BUDGET + 1u;
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    uint running = 0;
+    for (uint i = 0; i < num_clamps; i++) {
+        uint c = slots.Load(i * 16);
+        slots.Store(i * 16 + 8, running);
+        running = (CAP - running <= c) ? CAP : (running + c);
+    }
+}
+"#;
+
+const HOIST_TRIM: &str = r#"
+#define RS "RootConstants(num32BitConstants=1, b0), SRV(t0), UAV(u0), UAV(u1)"
+cbuffer Info : register(b0) {
+    uint num_in_chunk;
+};
+// uint4(slot_idx, dst_offset, kind, stride) per clamp in this chunk.
+ByteAddressBuffer metas : register(t0);
+RWByteAddressBuffer dst_args : register(u0);
+RWByteAddressBuffer slots : register(u1);
+static const uint BUDGET = 1u << 27;
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid3 : SV_GroupThreadID) {
+    if (gid.x >= num_in_chunk) return;
+    uint tid = gtid3.x;
+    uint4 m = metas.Load4(gid.x * 16);
+    uint slot_idx = m.x;
+    uint dst_offset = m.y;
+    uint kind = m.z;
+    uint stride = m.w;
+    uint3 s = slots.Load3(slot_idx * 16);
+    uint cost = s.x;
+    uint eff_count = s.y;
+    uint pref = s.z;
+    if (eff_count == 0) return;
+    if (pref <= BUDGET && cost <= BUDGET - pref) return;
+    if (pref >= BUDGET) {
+        for (uint r = tid; r < eff_count; r += 64u) {
+            uint at = dst_offset + r * stride;
+            if (kind <= 1) {
+                dst_args.Store2(at, uint2(0, 0));
+            } else {
+                dst_args.Store3(at, uint3(0, 0, 0));
+            }
+        }
+        return;
+    }
+    if (tid == 0) {
+        uint rem = BUDGET - pref;
+        for (uint r = 0; r < eff_count; r++) {
+            uint at = dst_offset + r * stride;
+            uint rc;
+            if (kind <= 1) {
+                uint2 c = dst_args.Load2(at);
+                rc = c.x * c.y;
+            } else if (kind == 2) {
+                uint3 g = dst_args.Load3(at);
+                rc = g.x * g.y * g.z * 64u;
+            } else {
+                uint3 g = dst_args.Load3(at);
+                rc = g.x * g.y * g.z * 128u;
+            }
+            if (rc <= rem) {
+                rem -= rc;
+            } else {
+                rem = 0;
+                if (kind <= 1) {
+                    dst_args.Store2(at, uint2(0, 0));
+                } else {
+                    dst_args.Store3(at, uint3(0, 0, 0));
+                }
+            }
+        }
+    }
+}
+"#;
+
+struct ShaderPso {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+}
+
+struct Clamp {
+    single: ShaderPso,
+    pass1: ShaderPso,
+    prefix: ShaderPso,
+    trim: ShaderPso,
 }
 
 // SAFETY: D3D12 objects are free-threaded.
@@ -145,15 +337,19 @@ fn make() -> windows::core::Result<Clamp> {
     make_for(device)
 }
 
-fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+fn compile_shader(
+    device: &ID3D12Device,
+    source: &str,
+    name: windows::core::PCSTR,
+) -> windows::core::Result<ShaderPso> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
-            s!("clamp"),
+            source.as_ptr().cast(),
+            source.len(),
+            name,
             None,
             None,
             s!("main"),
@@ -191,8 +387,17 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
             },
             ..Default::default()
         })?;
-        Ok(Clamp { root, pso })
+        Ok(ShaderPso { root, pso })
     }
+}
+
+fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    Ok(Clamp {
+        single: compile_shader(device, SOURCE, s!("clamp"))?,
+        pass1: compile_shader(device, HOIST_PASS1, s!("clamp_pass1"))?,
+        prefix: compile_shader(device, HOIST_PREFIX, s!("clamp_prefix"))?,
+        trim: compile_shader(device, HOIST_TRIM, s!("clamp_trim"))?,
+    })
 }
 
 /// Minimum record byte stride for a supported PC indirect argument `kind`.
@@ -307,8 +512,8 @@ fn record_clamp(
             ),
         ]);
         if records > 0 {
-            l.SetComputeRootSignature(&c.root);
-            l.SetPipelineState(&c.pso);
+            l.SetComputeRootSignature(&c.single.root);
+            l.SetPipelineState(&c.single.pso);
             l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
             l.SetComputeRootShaderResourceView(1, src_gpu);
             l.SetComputeRootShaderResourceView(2, count_gpu);
@@ -335,10 +540,12 @@ fn record_clamp(
 /// To find faults: 3 as 1 for mesh dispatches only, 4 as 1 for draws only,
 /// 5 as 1 with a new list for the clamps always, 6 the lists cut as for 1
 /// with each clamp before its draw all the same.
-/// 7 as 1 with the clamps run one after another (a barrier between them):
-/// the default. Without it whole mesh objects flickered (leaves, chairs,
-/// clothes: seen by the user, 2026-11-25), as records past the list's budget
-/// were not the same ones from frame to frame.
+/// 7 as 1 with the clamps run one after another (a barrier between them).
+/// 8 (default) 2-pass deterministic hoisted clamps: Pass 1 runs all clamps in
+/// parallel into disjoint destination slices and per-clamp cost slots with
+/// zero per-dispatch UAV barriers; `finish_hoisted` then runs one prefix sum
+/// and one trim dispatch per used chunk so budget trimming is deterministic
+/// without serializing the GPU across hundreds of dispatches.
 /// `VICTORY_HOIST_CLAMPS=<n>` sets it; diagnostics builds read it again
 /// every half second from the file `VICTORY_HOIST_FILE` names, if any.
 pub(crate) fn hoist_mode() -> u8 {
@@ -346,7 +553,7 @@ pub(crate) fn hoist_mode() -> u8 {
     static MODE: AtomicU8 = AtomicU8::new(u8::MAX);
     let mode = MODE.load(Ordering::Relaxed);
     if mode == u8::MAX {
-        let set = std::env::var("VICTORY_HOIST_CLAMPS").ok().and_then(|v| v.parse().ok()).unwrap_or(7);
+        let set = std::env::var("VICTORY_HOIST_CLAMPS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
         MODE.store(set, Ordering::Relaxed);
         if cfg!(feature = "diagnostics")
             && let Some(file) = std::env::var_os("VICTORY_HOIST_FILE")
@@ -359,7 +566,7 @@ pub(crate) fn hoist_mode() -> u8 {
                     if cuts != [0, 0] {
                         tracing::info!(cuts = cuts[0], queries = cuts[1], "lists cut for hoisted clamps");
                     }
-                    if let Some(n) = read.filter(|&n| n < 8 && n != MODE.load(Ordering::Relaxed)) {
+                    if let Some(n) = read.filter(|&n| n <= 8 && n != MODE.load(Ordering::Relaxed)) {
                         MODE.store(n, Ordering::Relaxed);
                         tracing::info!(mode = n, "clamps of indirect draws: mode changed");
                     }
@@ -393,7 +600,7 @@ pub(crate) fn bound_before(
     if records == 0 {
         return None;
     }
-    let (c, (budget_res, budget)) = (clamp()?, clamps.budget_resource()?);
+    let c = clamp()?;
     // SAFETY: live buffers.
     let (src_base, count_base) =
         unsafe { (src.GetGPUVirtualAddress(), count.map(|(b, _)| b.GetGPUVirtualAddress())) };
@@ -409,22 +616,58 @@ pub(crate) fn bound_before(
         (Some((_, off)), Some(base)) => (base.checked_add(off)?, 1, 0),
         _ => (src_gpu, 0, 0),
     };
-    if !src_gpu.is_multiple_of(4) || !count_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
+    if !src_gpu.is_multiple_of(4) || !count_gpu.is_multiple_of(4) {
+        return None;
+    }
+    let mode = hoist_mode();
+    let l = &clamps.list;
+    if mode == 8 {
+        if clamps.hoist_entry_count() >= crate::host::MAX_HOIST_SLOTS {
+            return None;
+        }
+        let (_, slots_gpu) = clamps.hoist_slots_resource()?;
+        if !slots_gpu.is_multiple_of(4) {
+            return None;
+        }
+        let (chunk_idx, dst, at) = clamps.clamp_room_indexed(bytes)?;
+        let slot_idx = clamps.push_hoist_entry(chunk_idx, at as u32, kind, stride)?;
+        // SAFETY: a live buffer.
+        let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
+        let constants = [kind, stride, records, args_offset, has_count, count_offset, slot_idx];
+        let bind_pipeline = clamps.bind_clamp_mode(2);
+        // SAFETY: an open list; our pass-1 root signature and pipeline; disjoint
+        // destination slice and per-clamp slot (no cross-dispatch UAV hazard).
+        unsafe {
+            if bind_pipeline {
+                l.SetComputeRootSignature(&c.pass1.root);
+                l.SetPipelineState(&c.pass1.pso);
+            }
+            l.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
+            l.SetComputeRootShaderResourceView(1, src_gpu);
+            l.SetComputeRootShaderResourceView(2, count_gpu);
+            l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+            l.SetComputeRootUnorderedAccessView(4, slots_gpu);
+            l.Dispatch(records.div_ceil(64), 1, 1);
+        }
+        return Some((dst, at));
+    }
+
+    let (budget_res, budget) = clamps.budget_resource()?;
+    if !budget.is_multiple_of(4) {
         return None;
     }
     let (dst, at) = clamps.clamp_room(bytes)?;
     // SAFETY: a live buffer.
     let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
     let constants = [kind, stride, records, args_offset, has_count, count_offset];
-    let l = &clamps.list;
-    let bind_pipeline = clamps.bind_clamp_once();
+    let bind_pipeline = clamps.bind_clamp_mode(1);
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, destination (writable: `clamp_room`) and budget buffers. The
     // clamps write apart and charge the budget atomically.
     unsafe {
         if bind_pipeline {
-            l.SetComputeRootSignature(&c.root);
-            l.SetPipelineState(&c.pso);
+            l.SetComputeRootSignature(&c.single.root);
+            l.SetPipelineState(&c.single.pso);
         }
         l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
         l.SetComputeRootShaderResourceView(1, src_gpu);
@@ -434,11 +677,88 @@ pub(crate) fn bound_before(
         l.Dispatch(records.div_ceil(64), 1, 1);
         // Mode 7: order budget updates on the budget buffer specifically rather
         // than issuing a global `pResource: None` UAV barrier across all work.
-        if hoist_mode() == 7 {
+        if mode == 7 {
             l.ResourceBarrier(&[uav_barrier_for(Some(budget_res))]);
         }
     }
     Some((dst, at))
+}
+
+/// Finishes any pending 2-pass hoisted clamps on `clamps` by running one
+/// prefix-sum dispatch and one trim dispatch per used chunk before
+/// [`HostList::clamp_end`] transitions chunks to `INDIRECT_ARGUMENT`.
+pub(crate) fn finish_hoisted(clamps: &HostList) {
+    let (entries, chunks) = clamps.take_hoist_batch();
+    if entries.is_empty() {
+        return;
+    }
+    let Some(c) = clamp() else { return };
+    let Some((slots_res, slots_gpu)) = clamps.hoist_slots_resource() else {
+        return;
+    };
+    let l = &clamps.list;
+    let num_clamps = entries.len() as u32;
+
+    // 1. Barrier on slots so Pass 1 cost/eff_count writes are visible to prefix sum.
+    // 2. Prefix sum across all `num_clamps` entries in a single dispatch.
+    // SAFETY: an open list; live `slots_res`; valid prefix root signature and PSO.
+    unsafe {
+        l.ResourceBarrier(&[uav_barrier_for(Some(slots_res))]);
+        l.SetComputeRootSignature(&c.prefix.root);
+        l.SetPipelineState(&c.prefix.pso);
+        l.SetComputeRoot32BitConstants(0, 1, (&raw const num_clamps).cast(), 0);
+        l.SetComputeRootUnorderedAccessView(1, slots_gpu);
+        l.Dispatch(1, 1, 1);
+    }
+
+    // 3. One batched UAV barrier for `slots_res` + every used chunk before trim.
+    let mut barriers = Vec::with_capacity(chunks.len() + 1);
+    barriers.push(uav_barrier_for(Some(slots_res)));
+    for chunk in &chunks {
+        barriers.push(uav_barrier_for(Some(chunk)));
+    }
+    // SAFETY: an open list; live resources; valid trim root signature and PSO.
+    unsafe {
+        l.ResourceBarrier(&barriers);
+        l.SetComputeRootSignature(&c.trim.root);
+        l.SetPipelineState(&c.trim.pso);
+        l.SetComputeRootUnorderedAccessView(3, slots_gpu);
+    }
+
+    // 4. One trim dispatch per chunk holding hoisted entries (usually just 1).
+    let mut chunk_metas: Vec<[u32; 4]> = Vec::new();
+    for (chunk_idx, chunk) in chunks.iter().enumerate() {
+        chunk_metas.clear();
+        for e in &entries {
+            if e.chunk == chunk_idx {
+                chunk_metas.push([e.slot, e.dst_offset, e.kind, e.stride]);
+            }
+        }
+        if chunk_metas.is_empty() {
+            continue;
+        }
+        let meta_bytes = (chunk_metas.len() * 16) as u64;
+        let Some((meta_gpu, meta_ptr)) = clamps.scratch(meta_bytes) else {
+            continue;
+        };
+        let count = chunk_metas.len() as u32;
+        // SAFETY: `scratch` returns mapped upload memory of at least `meta_bytes`,
+        // valid until `clamps.reset()`; `chunk` is a live UAV buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                chunk_metas.as_ptr().cast::<u8>(),
+                meta_ptr,
+                meta_bytes as usize,
+            );
+            let chunk_gpu = chunk.GetGPUVirtualAddress();
+            l.SetComputeRoot32BitConstants(0, 1, (&raw const count).cast(), 0);
+            l.SetComputeRootShaderResourceView(1, meta_gpu);
+            l.SetComputeRootUnorderedAccessView(2, chunk_gpu);
+            l.Dispatch(count, 1, 1);
+        }
+    }
+    // Trim replaced the list's bound compute pipeline.
+    let _ = clamps.bind_clamp_mode(0);
 }
 
 /// After indirect execution (or if preparation failed after [`bound`]):
@@ -509,7 +829,7 @@ void main() {
         submitted: u64,
         event: HANDLE,
         clamp: Clamp,
-        worker: Clamp,
+        worker: ShaderPso,
     }
 
     impl WarpHarness {
@@ -675,39 +995,8 @@ void main() {
         }
     }
 
-    fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: source and entry names outlive `D3DCompile`.
-        unsafe {
-            D3DCompile(
-                source.as_ptr().cast(),
-                source.len(),
-                s!("worker"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-            let code = code.unwrap();
-            let bytes = std::slice::from_raw_parts(
-                code.GetBufferPointer().cast::<u8>(),
-                code.GetBufferSize(),
-            );
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-            let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: bytes.as_ptr().cast(),
-                    BytecodeLength: bytes.len(),
-                },
-                ..Default::default()
-            })?;
-            Ok(Clamp { root, pso })
-        }
+    fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<ShaderPso> {
+        compile_shader(device, source, s!("worker"))
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
@@ -1115,5 +1404,171 @@ void main() {
         list.close();
         host.execute(&[&list]);
         list.reset();
+    }
+
+    /// WARP D3D12 test proving the 2-pass hoisted clamp (mode 8) runs multiple
+    /// Pass-1 dispatches with ZERO UAV barriers between them, computes exact
+    /// prefix sums in `HOIST_PREFIX`, and deterministically preserves earlier
+    /// clamps, trims the single boundary clamp in exact record order `0..n`,
+    /// and zeroes later clamps in `HOIST_TRIM`.
+    #[test]
+    fn warp_two_pass_hoisted_clamps_are_deterministic_without_per_dispatch_barriers() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_INDEXED: u32 = 1;
+        const STRIDE: u32 = 20;
+        const BUDGET_CAP: u32 = 1 << 27; // 134,217,728
+
+        // 4 hoisted clamps with costs:
+        // - Clamp 0: 1 record  of 16M * 3 = 48M  (prefix 0   -> KEEP)
+        // - Clamp 1: 1 record  of 16M * 3 = 48M  (prefix 48M -> KEEP; remaining = 38M)
+        // - Clamp 2: 4 records of 16M * 1 = 16M each (64M total, prefix 96M -> BOUNDARY:
+        //            records 0 & 1 = 32M <= 38M KEEP; records 2 & 3 ZEROED!)
+        // - Clamp 3: 2 records of 16M * 1 = 16M each (prefix 160M -> ZERO ALL)
+        let record_cost_16m: u32 = 1 << 24;
+        let clamp_specs: [(u32, &[(u32, u32)]); 4] = [
+            (0, &[(record_cost_16m, 3)]),
+            (64, &[(record_cost_16m, 3)]),
+            (
+                128,
+                &[
+                    (record_cost_16m, 1),
+                    (record_cost_16m, 1),
+                    (record_cost_16m, 1),
+                    (record_cost_16m, 1),
+                ],
+            ),
+            (256, &[(record_cost_16m, 1), (record_cost_16m, 1)]),
+        ];
+
+        let total_bytes = 512usize;
+        let (src_buf, src_ptr, src_gpu) = warp.shared_buffer(total_bytes as u64);
+        let (slots_buf, slots_ptr, slots_gpu) = warp.shared_buffer(256);
+        let (_meta_buf, meta_ptr, meta_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(total_bytes as u64);
+        let dst_buf = warp.default_uav(total_bytes as u64);
+
+        let mut initial_src = vec![0u8; total_bytes];
+        for (slot, (offset, recs)) in clamp_specs.iter().enumerate() {
+            for (r, &(cnt, inst)) in recs.iter().enumerate() {
+                let base = (*offset as usize) + r * (STRIDE as usize);
+                let words = [cnt, inst, 100 + slot as u32, r as u32, 0xABCD_0000 | r as u32];
+                for (w, v) in words.into_iter().enumerate() {
+                    initial_src[base + w * 4..base + (w + 1) * 4]
+                        .copy_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        let mut metas = [[0u32; 4]; 4];
+        for (slot, (offset, _)) in clamp_specs.iter().enumerate() {
+            metas[slot] = [slot as u32, *offset, KIND_INDEXED, STRIDE];
+        }
+
+        // SAFETY: mapped host buffers have sufficient capacity.
+        unsafe {
+            std::ptr::copy_nonoverlapping(initial_src.as_ptr(), src_ptr, total_bytes);
+            std::ptr::write_bytes(slots_ptr, 0, 256);
+            std::ptr::copy_nonoverlapping(metas.as_ptr().cast::<u8>(), meta_ptr, 64);
+            std::ptr::write_bytes(readback_ptr, 0, total_bytes);
+        }
+
+        // SAFETY: open command list, live resources, valid compiled clamp shaders.
+        unsafe {
+            let dst_gpu_base = dst_buf.GetGPUVirtualAddress();
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+            // Pass 1: all 4 dispatches back-to-back with ZERO barriers between them!
+            warp.list.SetComputeRootSignature(&warp.clamp.pass1.root);
+            warp.list.SetPipelineState(&warp.clamp.pass1.pso);
+            for (slot, (offset, recs)) in clamp_specs.iter().enumerate() {
+                let n = recs.len() as u32;
+                let constants = [KIND_INDEXED, STRIDE, n, *offset, 0u32, 0u32, slot as u32];
+                warp.list
+                    .SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, src_gpu);
+                warp.list.SetComputeRootShaderResourceView(2, src_gpu);
+                warp.list
+                    .SetComputeRootUnorderedAccessView(3, dst_gpu_base + u64::from(*offset));
+                warp.list.SetComputeRootUnorderedAccessView(4, slots_gpu);
+                warp.list.Dispatch(n.div_ceil(64), 1, 1);
+            }
+            // Prefix sum (1 barrier + 1 dispatch).
+            let num_clamps = 4u32;
+            warp.list
+                .ResourceBarrier(&[uav_barrier_for(Some(&slots_buf))]);
+            warp.list.SetComputeRootSignature(&warp.clamp.prefix.root);
+            warp.list.SetPipelineState(&warp.clamp.prefix.pso);
+            warp.list
+                .SetComputeRoot32BitConstants(0, 1, (&raw const num_clamps).cast(), 0);
+            warp.list.SetComputeRootUnorderedAccessView(1, slots_gpu);
+            warp.list.Dispatch(1, 1, 1);
+
+            // Trim (1 batched barrier + 1 dispatch for the whole chunk).
+            warp.list.ResourceBarrier(&[
+                uav_barrier_for(Some(&slots_buf)),
+                uav_barrier_for(Some(&dst_buf)),
+            ]);
+            warp.list.SetComputeRootSignature(&warp.clamp.trim.root);
+            warp.list.SetPipelineState(&warp.clamp.trim.pso);
+            warp.list
+                .SetComputeRoot32BitConstants(0, 1, (&raw const num_clamps).cast(), 0);
+            warp.list.SetComputeRootShaderResourceView(1, meta_gpu);
+            warp.list
+                .SetComputeRootUnorderedAccessView(2, dst_gpu_base);
+            warp.list.SetComputeRootUnorderedAccessView(3, slots_gpu);
+            warp.list.Dispatch(num_clamps, 1, 1);
+
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list
+                .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total_bytes as u64);
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        let _ = src_buf;
+        warp.submit_and_wait();
+
+        // SAFETY: GPU execution finished; read mapped results.
+        let (slot_words, out_bytes, after_src) = unsafe {
+            let sw = std::slice::from_raw_parts(slots_ptr.cast::<u32>().cast_const(), 16).to_vec();
+            let out = std::slice::from_raw_parts(readback_ptr.cast_const(), total_bytes).to_vec();
+            let src = std::slice::from_raw_parts(src_ptr.cast_const(), total_bytes).to_vec();
+            (sw, out, src)
+        };
+        assert_eq!(after_src, initial_src, "src_args must remain untouched");
+
+        // Verify per-clamp [cost, eff_count, prefix] computed by Pass 1 + Prefix:
+        assert_eq!(&slot_words[0..3], &[3 << 24, 1, 0]);
+        assert_eq!(&slot_words[4..7], &[3 << 24, 1, 3 << 24]);
+        assert_eq!(&slot_words[8..11], &[4 << 24, 4, 6 << 24]);
+        assert_eq!(&slot_words[12..15], &[2 << 24, 2, BUDGET_CAP + 1]);
+
+        let read_rec = |offset: usize, r: usize| -> [u32; 5] {
+            let base = offset + r * (STRIDE as usize);
+            std::array::from_fn(|w| {
+                u32::from_le_bytes(out_bytes[base + w * 4..base + (w + 1) * 4].try_into().unwrap())
+            })
+        };
+        // Clamp 0 & 1: fully kept.
+        assert_eq!(read_rec(0, 0), [record_cost_16m, 3, 100, 0, 0xABCD_0000]);
+        assert_eq!(read_rec(64, 0), [record_cost_16m, 3, 101, 0, 0xABCD_0000]);
+        // Clamp 2 (boundary): records 0 & 1 kept, records 2 & 3 deterministically zeroed.
+        assert_eq!(read_rec(128, 0), [record_cost_16m, 1, 102, 0, 0xABCD_0000]);
+        assert_eq!(read_rec(128, 1), [record_cost_16m, 1, 102, 1, 0xABCD_0001]);
+        assert_eq!(read_rec(128, 2), [0, 0, 102, 2, 0xABCD_0002]);
+        assert_eq!(read_rec(128, 3), [0, 0, 102, 3, 0xABCD_0003]);
+        // Clamp 3 (past budget): all records zeroed.
+        assert_eq!(read_rec(256, 0), [0, 0, 103, 0, 0xABCD_0000]);
+        assert_eq!(read_rec(256, 1), [0, 0, 103, 1, 0xABCD_0001]);
     }
 }

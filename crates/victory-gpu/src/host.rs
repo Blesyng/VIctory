@@ -659,8 +659,17 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
-    /// Whether the hoisted-clamp root signature & PSO are already bound on this list.
-    clamp_bound: std::sync::atomic::AtomicBool,
+    /// Per-clamp cost/count/prefix slots for 2-pass hoisted clamps (`indirect`),
+    /// zeroed at submission up to `hoist_slots_used`.
+    hoist_slots: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Number of 2-pass hoisted clamp slots used since the last reset.
+    hoist_slots_used: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Bound hoisted-clamp compute pipeline mode on this list (`0` = none,
+    /// `1` = legacy single-pass, `2` = two-pass Pass 1).
+    clamp_bound: std::sync::atomic::AtomicU8,
+    /// Monotonic counter incremented whenever a texture actually changes state
+    /// on this list; lets `draw::State` skip redundant SRV `readable()` checks.
+    state_epoch: std::sync::atomic::AtomicU64,
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
@@ -687,15 +696,30 @@ pub(crate) fn warn_depth_bounds() {
     ONCE.call_once(|| tracing::warn!("the host GPU has no depth bounds test; depth bounds are ignored"));
 }
 
+/// Maximum hoisted indirect clamps batched in a single 2-pass `clamps` list.
+pub(crate) const MAX_HOIST_SLOTS: usize = 4096;
+
+/// Metadata for one 2-pass hoisted indirect clamp recorded into a `HostList`.
+#[derive(Clone, Copy)]
+pub(crate) struct HoistEntry {
+    pub(crate) chunk: usize,
+    pub(crate) slot: u32,
+    pub(crate) dst_offset: u32,
+    pub(crate) kind: u32,
+    pub(crate) stride: u32,
+}
+
 /// A list's buffers for hoisted clamped indirect arguments with their
 /// states, how many are in use since the reset, the bytes taken of the last
-/// of those, and whether the list has the barrier that precedes the clamps.
+/// of those, whether the list has the barrier that precedes the clamps, and
+/// any 2-pass clamp entries pending prefix+trim in `finish_hoisted`.
 #[derive(Default)]
 struct ClampChunks {
     all: Vec<(ID3D12Resource, D3D12_RESOURCE_STATES)>,
     used: usize,
     at: u64,
     barrier: bool,
+    entries: Vec<HoistEntry>,
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -983,6 +1007,8 @@ struct Deferred {
     wait_marks: Vec<usize>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Whether a step zeroes the 2-pass hoisted clamp slots buffer.
+    hoist_slots_zeroed: bool,
 }
 
 impl Host {
@@ -1124,7 +1150,10 @@ impl Host {
                 pipelines: Mutex::default(),
                 queries: Mutex::default(),
                 budget: OnceLock::new(),
-                clamp_bound: std::sync::atomic::AtomicBool::new(false),
+                hoist_slots: OnceLock::new(),
+                hoist_slots_used: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                clamp_bound: std::sync::atomic::AtomicU8::new(0),
+                state_epoch: std::sync::atomic::AtomicU64::new(1),
                 indirect_args: Mutex::default(),
                 last_fence: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(feature = "diagnostics")]
@@ -1949,8 +1978,11 @@ impl HostList {
             chunks.used = 0;
             chunks.at = 0;
             chunks.barrier = false;
+            chunks.entries.clear();
         }
-        self.clamp_bound.store(false, Ordering::Relaxed);
+        self.hoist_slots_used.store(0, Ordering::Relaxed);
+        self.clamp_bound.store(0, Ordering::Relaxed);
+        self.state_epoch.fetch_add(1, Ordering::Relaxed);
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.queries.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1991,9 +2023,25 @@ impl HostList {
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some((texture, before))
+                if before != wanted {
+                    self.state_epoch.fetch_add(1, Ordering::Relaxed);
+                    Some((texture, before))
+                } else {
+                    None
+                }
             }
         }
+    }
+
+    /// Monotonic state-transition epoch for this list (bumped whenever any
+    /// texture actually changes state on this list or a helper pass runs).
+    pub(crate) fn state_epoch(&self) -> u64 {
+        self.state_epoch.load(Ordering::Relaxed)
+    }
+
+    /// Marks that an inline helper pass may have altered texture states on this list.
+    pub(crate) fn bump_state_epoch(&self) {
+        self.state_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records that this list starts and ends with `copy` in `wanted` state
@@ -2290,9 +2338,9 @@ impl HostList {
     }
 
     /// Room for `bytes` of clamped indirect arguments in this list's
-    /// buffers, writable by shaders from here on in the list: the buffer and
-    /// the offset. None for more than a buffer holds.
-    pub(crate) fn clamp_room(&self, bytes: u64) -> Option<(ID3D12Resource, u64)> {
+    /// buffers, writable by shaders from here on in the list: the chunk index,
+    /// buffer, and byte offset. None for more than a buffer holds.
+    pub(crate) fn clamp_room_indexed(&self, bytes: u64) -> Option<(usize, ID3D12Resource, u64)> {
         const CHUNK: u64 = 256 << 10;
         let bytes = bytes.next_multiple_of(16);
         if bytes > CHUNK {
@@ -2300,9 +2348,10 @@ impl HostList {
         }
         let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
         if chunks.used > 0 && chunks.at + bytes <= CHUNK {
+            let chunk_idx = chunks.used - 1;
             let at = chunks.at;
             chunks.at += bytes;
-            return Some((chunks.all[chunks.used - 1].0.clone(), at));
+            return Some((chunk_idx, chunks.all[chunk_idx].0.clone(), at));
         }
         // The next buffer, writable.
         if chunks.used == chunks.all.len() {
@@ -2332,7 +2381,56 @@ impl HostList {
             // SAFETY: an open list and live buffers.
             unsafe { self.list.ResourceBarrier(&barriers) };
         }
-        Some((buffer, 0))
+        Some((i, buffer, 0))
+    }
+
+    /// Room for `bytes` of clamped indirect arguments in this list's
+    /// buffers, writable by shaders from here on in the list: the buffer and
+    /// the offset. None for more than a buffer holds.
+    pub(crate) fn clamp_room(&self, bytes: u64) -> Option<(ID3D12Resource, u64)> {
+        self.clamp_room_indexed(bytes).map(|(_, buf, at)| (buf, at))
+    }
+
+    /// Number of 2-pass hoisted clamp entries recorded since the last flush/reset.
+    pub(crate) fn hoist_entry_count(&self) -> usize {
+        self.hoist_slots_used.load(Ordering::Relaxed)
+    }
+
+    /// Appends a 2-pass hoisted clamp entry and returns its slot index (`0..MAX_HOIST_SLOTS`).
+    pub(crate) fn push_hoist_entry(
+        &self,
+        chunk: usize,
+        dst_offset: u32,
+        kind: u32,
+        stride: u32,
+    ) -> Option<u32> {
+        let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = chunks.entries.len();
+        if slot >= MAX_HOIST_SLOTS {
+            return None;
+        }
+        chunks.entries.push(HoistEntry {
+            chunk,
+            slot: slot as u32,
+            dst_offset,
+            kind,
+            stride,
+        });
+        self.hoist_slots_used.store(slot + 1, Ordering::Relaxed);
+        Some(slot as u32)
+    }
+
+    /// Takes pending 2-pass hoisted clamp entries along with the active chunk
+    /// buffers (still in `UNORDERED_ACCESS`) for `indirect::finish_hoisted`.
+    pub(crate) fn take_hoist_batch(&self) -> (Vec<HoistEntry>, Vec<ID3D12Resource>) {
+        let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+        if chunks.entries.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let entries = std::mem::take(&mut chunks.entries);
+        let used = chunks.used;
+        let buffers = chunks.all[..used].iter().map(|(b, _)| b.clone()).collect();
+        (entries, buffers)
     }
 
     /// The clamped arguments written so far become readable as indirect
@@ -2484,10 +2582,40 @@ impl HostList {
         Some((gpu + at, (data + at as usize) as *mut u8))
     }
 
-    /// Returns `true` once per list reset so hoisted-clamp dispatches bind
-    /// their root signature and PSO only on the first clamp of the list.
-    pub(crate) fn bind_clamp_once(&self) -> bool {
-        !self.clamp_bound.swap(true, Ordering::Relaxed)
+    /// Returns `true` when the hoisted-clamp pipeline `mode` is not yet bound
+    /// on this list, avoiding redundant root signature and PSO binds.
+    pub(crate) fn bind_clamp_mode(&self, mode: u8) -> bool {
+        self.clamp_bound.swap(mode, Ordering::Relaxed) != mode
+    }
+
+    /// Host resource and GPU address of the per-clamp slot buffer for 2-pass
+    /// hoisted clamps (`MAX_HOIST_SLOTS * 16` bytes: `[cost, eff_count, prefix, 0]`),
+    /// zeroed before each submission for the slots actually used.
+    pub(crate) fn hoist_slots_resource(&self) -> Option<(&ID3D12Resource, u64)> {
+        let (buffer, data) = self
+            .hoist_slots
+            .get_or_init(|| {
+                let (b, d) = host()?.shared_buffer((MAX_HOIST_SLOTS * 16) as u64)?;
+                name(&b, || "hoisted clamp slots".to_string());
+                Some((b, d as usize))
+            })
+            .as_ref()?;
+        let mut deferred = self.deferred();
+        if !deferred.hoist_slots_zeroed {
+            deferred.hoist_slots_zeroed = true;
+            let at = *data;
+            let used = self.hoist_slots_used.clone();
+            deferred.copies.push(Step::Host(Box::new(move || {
+                let n = used.load(Ordering::Relaxed).min(MAX_HOIST_SLOTS);
+                if n > 0 {
+                    // SAFETY: persistently mapped shared buffer of `MAX_HOIST_SLOTS * 16` bytes,
+                    // written before the GPU list executes.
+                    unsafe { std::ptr::write_bytes(at as *mut u8, 0, n * 16) };
+                }
+            })));
+        }
+        // SAFETY: a live buffer.
+        Some((buffer, unsafe { buffer.GetGPUVirtualAddress() }))
     }
 
     /// The host resource and GPU address of the list's indirect-work budget,
