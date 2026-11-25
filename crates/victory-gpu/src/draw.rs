@@ -685,11 +685,15 @@ impl State {
         }
         const RENDER_TARGET: u32 = 0x4;
         const DEPTH_WRITE: u32 = 0x10;
+        let mut transitions: Vec<(This, u32)> = Vec::with_capacity(self.targets.len() + 1);
         for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
+            transitions.push((t as This, RENDER_TARGET));
         }
         if self.depth != 0 {
-            crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
+            transitions.push((self.depth as This, DEPTH_WRITE));
+        }
+        if !transitions.is_empty() {
+            crate::list::ensure_states(list, &transitions);
         }
         true
     }

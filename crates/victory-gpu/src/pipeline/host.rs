@@ -798,7 +798,34 @@ fn root_signature(
         }
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
-            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+                .to_vec();
+        // Deduplicate identical root signatures so consecutive draws sharing
+        // the same layout hit `draw::State`'s root-signature cache and skip
+        // redundant `SetGraphicsRootSignature` / `SetComputeRootSignature` calls.
+        struct CachedRoot(ID3D12RootSignature);
+        // SAFETY: `ID3D12RootSignature` is free-threaded in D3D12.
+        unsafe impl Send for CachedRoot {}
+        // SAFETY: as above.
+        unsafe impl Sync for CachedRoot {}
+        type RootSigCache =
+            std::sync::Mutex<std::collections::HashMap<(usize, Vec<u8>), CachedRoot>>;
+        static CACHE: std::sync::OnceLock<RootSigCache> = std::sync::OnceLock::new();
+        let key = (device.as_raw() as usize, bytes.clone());
+        let cache = CACHE.get_or_init(Default::default);
+        if let Some(existing) = cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return Ok((existing.0.clone(), bytes));
+        }
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, &bytes)?;
+        cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key)
+            .or_insert_with(|| CachedRoot(root.clone()));
+        Ok((root, bytes))
     }
 }

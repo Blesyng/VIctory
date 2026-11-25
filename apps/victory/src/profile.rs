@@ -166,6 +166,8 @@ impl HardwareProfile {
         vars.push(("VICTORY_STAGING_BUDGET_MB", staging_mb.to_owned()));
         vars.push(("VICTORY_SHADOW_EVICT_FRAMES", shadow_evict.to_owned()));
         vars.push(("VICTORY_POOL_MB", pool_mb.to_owned()));
+        // Uncap host frame pacing to avoid Windows timer sleep jitter (1–15 ms).
+        vars.push(("VICTORY_FPS", "0".to_owned()));
 
         if self.is_low_spec() {
             vars.push(("VICTORY_LOW_SPEC", "1".to_owned()));

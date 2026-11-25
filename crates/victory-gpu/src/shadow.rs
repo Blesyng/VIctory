@@ -220,17 +220,32 @@ fn pool_bytes_limit() -> usize {
 }
 
 /// Returns a snapshot buffer to the pool (at most 8 kept, the largest,
-/// and no more than [`pool_bytes_limit`] in all).
+/// and no more than [`pool_bytes_limit`] in all — always keeping at least
+/// the single largest reusable snapshot up to 256 MiB so low-spec mode does
+/// not discard and re-fault the world's main heap every submission).
 fn give_back(v: Vec<u8>) {
+    const SINGLE_SNAPSHOT_CAP: usize = 256 << 20;
     let limit = pool_bytes_limit();
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     pool.truncate(8);
     let mut total = 0;
+    let mut kept = 0usize;
     pool.retain(|v| {
-        total += v.capacity();
-        total <= limit
+        let cap = v.capacity();
+        if kept == 0 && cap <= SINGLE_SNAPSHOT_CAP {
+            total += cap;
+            kept += 1;
+            return true;
+        }
+        if total + cap <= limit {
+            total += cap;
+            kept += 1;
+            true
+        } else {
+            false
+        }
     });
 }
 
@@ -625,41 +640,94 @@ impl Shadow {
             let mode = self.watched.load(Ordering::Relaxed);
             let mut title: Option<Vec<u8>> = None;
             let mut synced = Vec::new();
+
+            // Build page spans `(at, n)` for this range. When a single buffer
+            // span covers >= 32 pages (>= 2 MiB), compare pages in parallel
+            // across CPU cores first so untouched pages are skipped 3–5x faster.
+            let mut spans: Vec<(usize, usize)> = Vec::new();
             let mut at = from;
             while at < to {
                 let n = (PAGE - (start + at) % PAGE).min(to - at);
+                let page_idx = (start + at) / PAGE - unchanged.start / PAGE;
+                if !unchanged.pages[page_idx] {
+                    spans.push((at, n));
+                }
+                at += n;
+            }
+            let dirty_flags: Vec<bool> = if spans.len() >= 32 {
+                let workers = std::thread::available_parallelism()
+                    .map_or(2, |n| n.get().clamp(2, 6));
+                let chunk_len = spans.len().div_ceil(workers);
+                let data_addr = self.data as usize;
+                let mut flags = vec![false; spans.len()];
+                std::thread::scope(|scope| {
+                    for (span_chunk, flag_chunk) in
+                        spans.chunks(chunk_len).zip(flags.chunks_mut(chunk_len))
+                    {
+                        scope.spawn(move || {
+                            for (&(at, n), dirty) in span_chunk.iter().zip(flag_chunk.iter_mut()) {
+                                // SAFETY: read-only comparison of disjoint slices inside the
+                                // live host mapping while the submitting thread waits below.
+                                let host = unsafe {
+                                    std::slice::from_raw_parts(
+                                        (data_addr as *const u8).add(at),
+                                        n,
+                                    )
+                                };
+                                let old = &before[at - from..at - from + n];
+                                *dirty = host != old;
+                            }
+                        });
+                    }
+                });
+                flags
+            } else {
+                spans
+                    .iter()
+                    .map(|&(at, n)| {
+                        // SAFETY: inside the live mapping on the submitting thread.
+                        let host = unsafe { std::slice::from_raw_parts(self.data.add(at), n) };
+                        let old = &before[at - from..at - from + n];
+                        host != old
+                    })
+                    .collect()
+            };
+
+            for (&(at, n), &is_dirty) in spans.iter().zip(dirty_flags.iter()) {
+                if !is_dirty {
+                    let page_idx = (start + at) / PAGE - unchanged.start / PAGE;
+                    unchanged.pages[page_idx] = true;
+                    continue;
+                }
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
-                if unchanged.differs(start + at, host, old) {
-                    let buf = title.get_or_insert_with(|| {
-                        let mut v = pooled(PAGE);
-                        v.resize(PAGE, 0);
-                        v
-                    });
-                    let title_slice = &mut buf[..n];
-                    if crate::host::read_into((start + at) as *const u8, title_slice) {
-                        // Title memory with the GPU's bytes put in; the copy
-                        // takes the title's bytes in turn.
-                        if let Some((dirty_start, dirty_end)) =
-                            merge_gpu_writes(title_slice, host, old)
-                        {
-                            let dirty_len = dirty_end - dirty_start;
-                            if mode != 1 {
-                                crate::watch::writing(start + at + dirty_start, dirty_len);
-                            }
-                            crate::host::write_mapped(
-                                (start + at + dirty_start) as *mut u8,
-                                title_slice[dirty_start..].as_ptr(),
-                                dirty_len,
-                            );
-                            written += dirty_len;
+                let buf = title.get_or_insert_with(|| {
+                    let mut v = pooled(PAGE);
+                    v.resize(PAGE, 0);
+                    v
+                });
+                let title_slice = &mut buf[..n];
+                if crate::host::read_into((start + at) as *const u8, title_slice) {
+                    // Title memory with the GPU's bytes put in; the copy
+                    // takes the title's bytes in turn.
+                    if let Some((dirty_start, dirty_end)) =
+                        merge_gpu_writes(title_slice, host, old)
+                    {
+                        let dirty_len = dirty_end - dirty_start;
+                        if mode != 1 {
+                            crate::watch::writing(start + at + dirty_start, dirty_len);
                         }
-                        synced.push((start + at) / PAGE);
+                        crate::host::write_mapped(
+                            (start + at + dirty_start) as *mut u8,
+                            title_slice[dirty_start..].as_ptr(),
+                            dirty_len,
+                        );
+                        written += dirty_len;
                     }
+                    synced.push((start + at) / PAGE);
                 }
-                at += n;
             }
             if let Some(buf) = title {
                 give_back(buf);
@@ -856,10 +924,11 @@ impl Shadow {
             static READ: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0; PAGE]);
         }
         let mut bytes = 0;
-        // The title's unmapped memory found last: tiles of it have no memory
-        // here either (reads give zeros). Tens of thousands of tiles a frame
-        // were zeros copied, 1.4 GB of them.
-        let mut hole = 0..0;
+        // Cache both mapped AND unmapped VM regions returned by `VirtualQuery`
+        // so consecutive 64 KiB tiles in the same committed region do not emit
+        // a redundant `VirtualQuery` syscall per tile.
+        let mut region = 0..0;
+        let mut region_unmapped = false;
         let mut at = from;
         while at < to {
             let n = (PAGE - at % PAGE).min(to - at);
@@ -875,13 +944,12 @@ impl Shadow {
                 at = next;
                 continue;
             }
-            if !(hole.contains(&whole.start) && whole.end <= hole.end) {
-                hole = match unmapped(whole.start) {
-                    Some(end) => whole.start..end,
-                    None => 0..0,
-                };
+            if !(region.contains(&whole.start) && whole.end <= region.end) {
+                let (is_hole, end) = memory_region(whole.start);
+                region = whole.start..end;
+                region_unmapped = is_hole;
             }
-            if whole.start >= hole.start && whole.end <= hole.end {
+            if region_unmapped {
                 if !look.hole {
                     look.hole = true;
                     look.blocks = [0; PAGE / BLOCK];
@@ -1246,8 +1314,10 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
     Some(window)
 }
 
-/// Where the unmapped title memory `address` is in ends, if it is.
-fn unmapped(address: usize) -> Option<usize> {
+/// Returns `(is_unmapped, region_end)` for the VM region containing `address`,
+/// allowing callers to skip redundant `VirtualQuery` syscalls for both mapped
+/// and unmapped contiguous spans.
+fn memory_region(address: usize) -> (bool, usize) {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
     };
@@ -1256,10 +1326,10 @@ fn unmapped(address: usize) -> Option<usize> {
         let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
         let size = size_of_val(&info);
         if VirtualQuery(address as *const _, &mut info, size) != size {
-            return Some((address | (CHUNK as usize - 1)) + 1);
+            return (true, (address | (CHUNK as usize - 1)) + 1);
         }
-        (info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS)
-            .then(|| info.BaseAddress as usize + info.RegionSize)
+        let is_unmapped = info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS;
+        (is_unmapped, info.BaseAddress as usize + info.RegionSize)
     }
 }
 

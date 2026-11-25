@@ -585,15 +585,32 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 /// Moves a title texture's host copy to `state` in the list, if needed.
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
+    ensure_states(list, &[(resource, state)]);
+}
+
+/// Moves multiple title textures' host copies to their target states in a
+/// single batched `ResourceBarrier` call, avoiding per-resource GPU stalls.
+#[cfg(windows)]
+pub(crate) fn ensure_states(list: &crate::host::HostList, transitions: &[(This, u32)]) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-    if !resource.is_null() {
+    let mut barriers = Vec::new();
+    for &(resource, state) in transitions {
+        if resource.is_null() {
+            continue;
+        }
         crate::resource::note_written(resource, state);
+        if let Some((texture, before)) = list.transition(resource, state) {
+            let legal = crate::host::legal_state(texture, state);
+            barriers.push(crate::host::transition(
+                texture,
+                State(before as i32),
+                State(legal as i32),
+            ));
+        }
     }
-    if let Some((texture, before)) = list.transition(resource, state) {
-        let state = crate::host::legal_state(texture, state);
-        let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
-        // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+    if !barriers.is_empty() {
+        // SAFETY: an open list and live host textures.
+        unsafe { list.list.ResourceBarrier(&barriers) };
     }
 }
 

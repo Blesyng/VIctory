@@ -659,6 +659,8 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Whether the hoisted-clamp root signature & PSO are already bound on this list.
+    clamp_bound: std::sync::atomic::AtomicBool,
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
@@ -1122,6 +1124,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 queries: Mutex::default(),
                 budget: OnceLock::new(),
+                clamp_bound: std::sync::atomic::AtomicBool::new(false),
                 indirect_args: Mutex::default(),
                 last_fence: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(feature = "diagnostics")]
@@ -1509,7 +1512,7 @@ impl Host {
                     COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
                 }
             } else {
-                in_parallel(&groups, 8, |chunk| {
+                in_parallel(&groups, 1, |chunk| {
                     for g in chunk {
                         for (shadow, address, len) in g {
                             let written = shadow.copy_back(*address, *len);
@@ -1947,6 +1950,7 @@ impl HostList {
             chunks.at = 0;
             chunks.barrier = false;
         }
+        self.clamp_bound.store(false, Ordering::Relaxed);
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.queries.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2480,9 +2484,15 @@ impl HostList {
         Some((gpu + at, (data + at as usize) as *mut u8))
     }
 
-    /// The host address of the list's indirect-work budget, zeroed at each
-    /// submission of the list from the first use after a reset on.
-    pub(crate) fn budget(&self) -> Option<u64> {
+    /// Returns `true` once per list reset so hoisted-clamp dispatches bind
+    /// their root signature and PSO only on the first clamp of the list.
+    pub(crate) fn bind_clamp_once(&self) -> bool {
+        !self.clamp_bound.swap(true, Ordering::Relaxed)
+    }
+
+    /// The host resource and GPU address of the list's indirect-work budget,
+    /// zeroed at each submission of the list from the first use after a reset on.
+    pub(crate) fn budget_resource(&self) -> Option<(&ID3D12Resource, u64)> {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
@@ -2500,7 +2510,13 @@ impl HostList {
                 .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
         }
         // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
+        Some((buffer, unsafe { buffer.GetGPUVirtualAddress() }))
+    }
+
+    /// The host address of the list's indirect-work budget, zeroed at each
+    /// submission of the list from the first use after a reset on.
+    pub(crate) fn budget(&self) -> Option<u64> {
+        self.budget_resource().map(|(_, gpu)| gpu)
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
@@ -2865,11 +2881,31 @@ impl Early {
         }
         const COPY_DEST: i32 = D3D12_RESOURCE_STATE_COPY_DEST.0;
         const SHADER_RESOURCE: u32 = 0x40 | 0x80;
-        for (staging, copy) in first {
-            if used.contains(&(std::sync::Arc::as_ptr(&copy) as usize))
-                || !batch.texture_due(&staging)
-                || !staging.refresh()
-            {
+        let candidates: Vec<_> = first
+            .into_iter()
+            .filter(|(staging, copy)| {
+                !used.contains(&(std::sync::Arc::as_ptr(copy) as usize))
+                    && batch.texture_due(staging)
+            })
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        // Refresh (copy + BLAKE3 hash + detile) textures in parallel across
+        // CPU cores before recording D3D12 barriers and copies in order.
+        let ready: Vec<std::sync::atomic::AtomicBool> = (0..candidates.len())
+            .map(|_| std::sync::atomic::AtomicBool::new(false))
+            .collect();
+        let indexed: Vec<usize> = (0..candidates.len()).collect();
+        in_parallel(&indexed, 2, |chunk| {
+            for &i in chunk {
+                if candidates[i].0.refresh() {
+                    ready[i].store(true, Ordering::Relaxed);
+                }
+            }
+        });
+        for (i, (staging, copy)) in candidates.into_iter().enumerate() {
+            if !ready[i].load(Ordering::Relaxed) {
                 continue;
             }
             let real = copy.state.swap(SHADER_RESOURCE, Ordering::Relaxed) as i32;

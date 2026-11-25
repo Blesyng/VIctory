@@ -89,14 +89,11 @@ struct Journal {
     asked: u64,
     /// Page number → the asking that last found it written.
     written: BTreeMap<usize, u64>,
-    /// Room for the kernel's answer.
-    found: Vec<usize>,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
-    found: Vec::new(),
 });
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -108,26 +105,40 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
-    let guarded = if failed {
-        count = 0;
+
+    // Perform the kernel syscall OUTSIDE `JOURNAL.lock()` using a reusable
+    // thread-local buffer so worker threads in `Batch::prepare_bindless` do not
+    // serialize on the global mutex while inside `GetWriteWatch`.
+    thread_local! {
+        static WATCH_BUF: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let mut found_pages: Vec<usize> = Vec::new();
+    let failed = WATCH_BUF.with_borrow_mut(|buf| {
+        if buf.len() < count {
+            buf.resize(count, 0);
+        }
+        // SAFETY: `buf` holds at least `count` entries.
+        let err = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                buf.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
+        if !err && count > 0 {
+            found_pages.extend(buf[..count].iter().map(|&at| at / PAGE));
+        }
+        err
+    });
+
+    let guarded_pages = if failed {
         if !guarded {
             return None;
         }
@@ -141,10 +152,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         add(C::Watches, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
     }
+
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    for page in found_pages.into_iter().chain(guarded_pages) {
         j.written.insert(page, now);
     }
     Some((

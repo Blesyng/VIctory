@@ -416,37 +416,45 @@ impl BindlessPlan {
 fn copy_bounces(list: &[(usize, u64, u32)]) {
     const GAP: u64 = 4 << 10;
     const RUN: u64 = 128 << 10;
-    let mut scratch = vec![0u8; RUN as usize];
-    let mut rest = list;
-    while let Some(&(_, first, len)) = rest.first() {
-        let mut end = first + u64::from(len);
-        let mut n = 1;
-        for &(_, a, l) in &rest[1..] {
-            let to = end.max(a + u64::from(l));
-            if a < first || a > end + GAP || to - first > RUN {
-                break;
-            }
-            end = to;
-            n += 1;
-        }
-        let (run, after) = rest.split_at(n);
-        rest = after;
-        let whole = (end - first) as usize;
-        let read = n > 1
-            && whole <= scratch.len()
-            && crate::host::read_into(first as *const u8, &mut scratch[..whole]);
-        for &(cpu, a, l) in run {
-            if read {
-                let from = &scratch[(a - first) as usize..][..l as usize];
-                // SAFETY: a bounce slice of at least `l` bytes, ours.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(from.as_ptr(), cpu as *mut u8, l as usize);
-                }
-            } else {
-                crate::host::copy_mapped(cpu as *mut u8, a as *const u8, l as usize, false);
-            }
-        }
+    thread_local! {
+        static BOUNCE_SCRATCH: std::cell::RefCell<Vec<u8>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
+    BOUNCE_SCRATCH.with_borrow_mut(|scratch| {
+        if scratch.len() < RUN as usize {
+            scratch.resize(RUN as usize, 0);
+        }
+        let mut rest = list;
+        while let Some(&(_, first, len)) = rest.first() {
+            let mut end = first + u64::from(len);
+            let mut n = 1;
+            for &(_, a, l) in &rest[1..] {
+                let to = end.max(a + u64::from(l));
+                if a < first || a > end + GAP || to - first > RUN {
+                    break;
+                }
+                end = to;
+                n += 1;
+            }
+            let (run, after) = rest.split_at(n);
+            rest = after;
+            let whole = (end - first) as usize;
+            let read = n > 1
+                && whole <= scratch.len()
+                && crate::host::read_into(first as *const u8, &mut scratch[..whole]);
+            for &(cpu, a, l) in run {
+                if read {
+                    let from = &scratch[(a - first) as usize..][..l as usize];
+                    // SAFETY: a bounce slice of at least `l` bytes, ours.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(from.as_ptr(), cpu as *mut u8, l as usize);
+                    }
+                } else {
+                    crate::host::copy_mapped(cpu as *mut u8, a as *const u8, l as usize, false);
+                }
+            }
+        }
+    });
 }
 
 /// `ranges` (host copy, address, bytes) sorted and merged per host copy

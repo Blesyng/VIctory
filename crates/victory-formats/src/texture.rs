@@ -670,37 +670,44 @@ impl Layout {
         let linear = self.desc.swizzle == Swizzle::LINEAR;
         // The row and depth contribute one common base to every column, so
         // the same contiguous runs repeat on every row, including mip tails.
-        let mut runs = Vec::new();
-        if !linear {
-            let mut first_linear = 0;
-            let mut first_tiled = self.column(m, 0) as usize;
-            for x in 1..m.width {
-                let offset = self.column(m, x) as usize;
-                let at = x as usize * n;
-                if offset != first_tiled + (at - first_linear) {
-                    runs.push((first_tiled, first_linear, at - first_linear));
-                    first_tiled = offset;
-                    first_linear = at;
-                }
-            }
-            runs.push((first_tiled, first_linear, bytes - first_linear));
+        // Reuse a thread-local buffer to avoid per-subresource heap allocations.
+        thread_local! {
+            static RUNS: std::cell::RefCell<Vec<(usize, usize, usize)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
         }
-        for z in 0..depth {
-            let (s, inner) = self.split(first + z);
-            let base = u64::from(s) * self.slice_size + m.offset;
-            for y in 0..m.height {
-                let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
-                if linear {
-                    let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
-                    copy(tiled_row as usize, linear_row, bytes);
-                } else {
-                    let tiled_row = (base + self.row(m, y, inner)) as usize;
-                    for &(tiled, linear, len) in &runs {
-                        copy(tiled_row + tiled, linear_row + linear, len);
+        RUNS.with_borrow_mut(|runs| {
+            runs.clear();
+            if !linear {
+                let mut first_linear = 0;
+                let mut first_tiled = self.column(m, 0) as usize;
+                for x in 1..m.width {
+                    let offset = self.column(m, x) as usize;
+                    let at = x as usize * n;
+                    if offset != first_tiled + (at - first_linear) {
+                        runs.push((first_tiled, first_linear, at - first_linear));
+                        first_tiled = offset;
+                        first_linear = at;
+                    }
+                }
+                runs.push((first_tiled, first_linear, bytes - first_linear));
+            }
+            for z in 0..depth {
+                let (s, inner) = self.split(first + z);
+                let base = u64::from(s) * self.slice_size + m.offset;
+                for y in 0..m.height {
+                    let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+                    if linear {
+                        let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
+                        copy(tiled_row as usize, linear_row, bytes);
+                    } else {
+                        let tiled_row = (base + self.row(m, y, inner)) as usize;
+                        for &(tiled, linear, len) in runs.iter() {
+                            copy(tiled_row + tiled, linear_row + linear, len);
+                        }
                     }
                 }
             }
-        }
+        });
         Ok(())
     }
 }

@@ -393,7 +393,7 @@ pub(crate) fn bound_before(
     if records == 0 {
         return None;
     }
-    let (c, budget) = (clamp()?, clamps.budget()?);
+    let (c, (budget_res, budget)) = (clamp()?, clamps.budget_resource()?);
     // SAFETY: live buffers.
     let (src_base, count_base) =
         unsafe { (src.GetGPUVirtualAddress(), count.map(|(b, _)| b.GetGPUVirtualAddress())) };
@@ -417,22 +417,25 @@ pub(crate) fn bound_before(
     let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
     let constants = [kind, stride, records, args_offset, has_count, count_offset];
     let l = &clamps.list;
+    let bind_pipeline = clamps.bind_clamp_once();
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, destination (writable: `clamp_room`) and budget buffers. The
-    // clamps write apart and charge the budget atomically: no barriers.
+    // clamps write apart and charge the budget atomically.
     unsafe {
-        l.SetComputeRootSignature(&c.root);
-        l.SetPipelineState(&c.pso);
+        if bind_pipeline {
+            l.SetComputeRootSignature(&c.root);
+            l.SetPipelineState(&c.pso);
+        }
         l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
         l.SetComputeRootShaderResourceView(1, src_gpu);
         l.SetComputeRootShaderResourceView(2, count_gpu);
         l.SetComputeRootUnorderedAccessView(3, dst_gpu);
         l.SetComputeRootUnorderedAccessView(4, budget);
         l.Dispatch(records.div_ceil(64), 1, 1);
-        // Mode 7: one clamp after another, so that the budget is charged in
-        // the order of the draws as it is when each clamp precedes its draw.
+        // Mode 7: order budget updates on the budget buffer specifically rather
+        // than issuing a global `pResource: None` UAV barrier across all work.
         if hoist_mode() == 7 {
-            l.ResourceBarrier(&[uav_barrier()]);
+            l.ResourceBarrier(&[uav_barrier_for(Some(budget_res))]);
         }
     }
     Some((dst, at))
@@ -456,12 +459,21 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+    uav_barrier_for(None)
+}
+
+fn uav_barrier_for(resource: Option<&ID3D12Resource>) -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
             UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                pResource: std::mem::ManuallyDrop::new(None),
+                pResource: match resource {
+                    // SAFETY: a borrowed pointer; the barrier never releases it
+                    // (matching `crate::host::transition`).
+                    Some(r) => unsafe { std::mem::transmute_copy(r) },
+                    None => std::mem::ManuallyDrop::new(None),
+                },
             }),
         },
     }
