@@ -109,14 +109,16 @@ static USES: AtomicU64 = AtomicU64::new(0);
 
 /// The staging bytes kept before the least recently used buffers no list
 /// holds are released (made again, and detiled whole, on their next use):
-/// `VICTORY_STAGING_BUDGET_MB`, 384 MiB by default.
+/// `VICTORY_STAGING_BUDGET_MB`, 384 MiB by default (128 MiB in low-spec mode).
 fn budget() -> u64 {
     static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *BUDGET.get_or_init(|| {
+        let low_spec = std::env::var("VICTORY_LOW_SPEC").as_deref() == Ok("1");
+        let default_mb = if low_spec { 128 } else { 384 };
         std::env::var("VICTORY_STAGING_BUDGET_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(384)
+            .unwrap_or(default_mb)
             << 20
     })
 }

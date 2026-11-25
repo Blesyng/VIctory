@@ -1149,30 +1149,40 @@ fn over_cap(d: &ResourceDesc) -> u32 {
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
     });
-    if !STREAMED.get() || textures() != Textures::Stream {
+    let low_spec = std::env::var("VICTORY_LOW_SPEC").as_deref() == Ok("1");
+    let forced = set.is_some() || low_spec;
+    if !forced && (!STREAMED.get() || textures() != Textures::Stream) {
         return 0;
     }
-    let max = set.unwrap_or_else(|| match video_memory_percent() {
-        0..70 => 1024,
-        70..85 => 512,
-        _ => 256,
+    let max = set.unwrap_or_else(|| {
+        if low_spec {
+            512
+        } else {
+            match video_memory_percent() {
+                0..70 => 1024,
+                70..85 => 512,
+                _ => 256,
+            }
+        }
     });
     const TEXTURE2D: u32 = 3;
     let block = (70..=84).contains(&d.format) || (94..=99).contains(&d.format);
-    if cfg!(test)
+    let uncompressed = (27..=32).contains(&d.format);
+    if (cfg!(test) && set.is_none() && !low_spec)
         || max == 0
         || d.dimension != TEXTURE2D
         || d.flags & 7 != 0
-        || !block
+        || (!block && !uncompressed)
         || d.mip_levels < 2
     {
         return 0;
     }
+    let align: u64 = if block { 4 } else { 1 };
     let mut skip = 0;
     while (d.width.max(u64::from(d.height)) >> skip) > max
         && skip + 1 < u32::from(d.mip_levels)
-        && (d.width >> (skip + 1)).is_multiple_of(4)
-        && (d.height >> (skip + 1)).is_multiple_of(4)
+        && (d.width >> (skip + 1)) % align == 0
+        && u64::from(d.height >> (skip + 1)) % align == 0
         && d.width >> (skip + 1) > 0
         && d.height >> (skip + 1) > 0
     {
@@ -2887,5 +2897,24 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn test_over_cap_behavior() {
+        let desc = ResourceDesc {
+            dimension: 3, // TEXTURE2D
+            alignment: 0,
+            width: 2048,
+            height: 2048,
+            depth_or_array_size: 1,
+            mip_levels: 8,
+            format: 71, // BC1_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 0,
+        };
+        // Without VICTORY_TEXTURE_MAX and without STREAMED, returns 0:
+        assert_eq!(over_cap(&desc), 0);
     }
 }
